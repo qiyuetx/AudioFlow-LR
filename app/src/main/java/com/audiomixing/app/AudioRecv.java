@@ -1,0 +1,2303 @@
+package com.audiomixing.app;
+
+import android.content.Context;
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
+import android.media.AudioTrack;
+import android.net.wifi.WifiManager;
+import android.os.Build;
+import android.os.SystemClock;
+import android.util.Log;
+
+import java.io.IOException;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.SocketTimeoutException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+/**
+ * 接收 + 抖动缓冲 + 混音播放。
+ *
+ * <p>一个 UDP socket 绑 {@link Proto#DEFAULT_AUDIO_PORT}，收到的每个包按
+ * <b>来源 + ssrc</b> 分流到各自的抖动缓冲；播放线程每 10 毫秒从每个流取一帧，
+ * 相加（削顶保护）后写进一个 {@link AudioTrack}。多台手机同时"送声音"就是靠这一步混在一起的。
+ *
+ * <p><b>为什么要有抖动缓冲</b>：Wi-Fi 上包不会匀速到达，早到晚到几十毫秒是常态。
+ * 每收到一包就立刻播，晚到的包只能扔掉（咔哒声）；先攒 {@value #DEFAULT_TARGET_MS} 毫秒再匀速播，
+ * 抖动就被吸收掉了。代价是固定多这么点延迟 —— 局域网内这个交换很划算。
+ *
+ * <p><b>丢包为什么用静音补</b>：播放时钟必须匀速往前走。等丢的那一包，
+ * 整条流就会卡一下、后面的包全变成"迟到"；直接补一段静音，听感上只是一个极短的凹陷，
+ * 而且是可预期的。包真丢了就补静音，包晚到了就按序号放进缓冲（还没播到就还来得及）。
+ *
+ * <p><b>为什么不做 PING/PONG 时钟对齐</b>：设计文档里的 PING/PONG 是为了算两台设备的时钟偏差。
+ * 但接收端现在是"按到达顺序 + 预缓冲"播放，局域网上时钟偏差远小于 100 毫秒的缓冲目标，
+ * 拿它去做播放时刻判断反而会引入新的抖；两端的时钟漂移由缓冲深度自适应吸收。
+ * 协议字段 {@code ts_ns} 照收，用来判断"这包在路上走了多久"。
+ *
+ * <p><b>不用 Opus</b>：手机端只有 PCM16（见设计文档第三节），收到别的 codec 直接丢并计数，
+ * 这样整包 APK 不需要一行 NDK。
+ *
+ * <p><b>线程</b>：一个收包线程（网络）+ 一个播放线程（音频 + 混音）。
+ * 界面线程只读 {@link #stats()} / {@link #peak()}，绝不碰 socket 和 AudioTrack。
+ */
+public final class AudioRecv {
+
+    private static final String TAG = "AM-AudioRecv";
+
+    /** 一帧的字节数（480 帧 × 2 声道 × 2 字节）。 */
+    public static final int FRAME_BYTES = Proto.FRAME_SAMPLES * Proto.CHANNELS * 2;
+    /**
+     * 抖动缓冲默认目标（毫秒）。
+     *
+     * <p>★ 2026-11-14 用户把优先级挑明了：<b>不卡 + 同步第一，延迟高一点无所谓</b>。
+     *   之前是 120ms，而实测 Wi-Fi 每 20 秒一次的后台扫描会制造 ~200ms 的空窗 ——
+     *   120ms 缓冲盖不住，必欠载，表现就是「放一会卡一下、再流畅一会」（周期性）。
+     *   ★ 2026-11-14：真机证实 Wi-Fi 每 20s 一次的 CMD_START_SCAN 会把接收打断 ~400ms，
+     *   把 400ms 缓冲抽干 → 流重置 → "卡一下"。用户接受延迟，故垫到 700ms
+     *   （稳态 ≈ 700~780ms，足以扛住 400~600ms 的扫描空窗，不再抽干/重置）。
+     *   代价：整体声音晚出 ~700ms。用户明确接受（不卡第一）。
+     *
+     * <p>（历史：2026-11-13 曾试 320ms 深缓冲并判「越来越快、比原版还卡」——那次真因是
+     *   播放输出层欠载 + 监控抢锁 + 每包分配，不是缓冲太深；这几项 2.46~2.48 已修，
+     *   所以现在深缓冲才真正安全有效。）
+     *
+     * <p>★ 2026-11-14（用户：「继续把延迟加大到 3000 毫秒」）：2000 → 3000 毫秒。
+     *   用户明确不卡第一、延迟无所谓，直接顶到档位表最大的一档，把任何残留的
+     *   周期性断流（扫描/漫游/发送端小抖）都留出 3 秒保险余量。
+     *
+     * <p>★ 2026-11-14（实测定档）：3000 → <b>1500</b>。
+     *   装上 640ms 冗余副本之后，抗丢包已经不再依赖"把缓冲垫到天上去"：
+     *   <pre>
+     *   档位   实测结论
+     *   500    30 秒丢 53~57 帧（≈5%），副本全变"迟到"白发 —— 不可用
+     *   1000   26 秒持续 +13 帧，深度只 640~870ms —— 仍会丢
+     *   1500   丢恒定不增长，深度 1420~1880ms —— 实测下限
+     *   </pre>
+     *   代价：端到端约 1500 + 300(本机延迟) + 200(输出预填) ≈ 2 秒。
+     */
+    public static final int DEFAULT_TARGET_MS = 1500;
+    public static final int MIN_TARGET_MS = 100;
+    // ★ 上限必须 ≥ DEFAULT_TARGET_MS，否则 setTargetBufferMs 会把深缓冲夹回去。
+    public static final int MAX_TARGET_MS = 3100;
+    /** 环形缓冲槽数，必须是 2 的幂（取模只花一次与运算）：64 槽 = 640 毫秒。
+     *
+     *  <p>★ 2026-11-12：原来是 32 槽（320ms）。逐设备延迟补偿最多要 300ms，
+     *  叠在抖动目标（100~200ms）之上就超过 320ms 了 —— 超出的包会被 store() 判成
+     *  "太超前"直接丢掉，表现是设了 300ms 反而一直丢包、声音断续。
+     *  槽数翻倍只多占约 30KB 内存（每槽 960 字节），换到的是延迟真的加得上去。
+     */
+    // ★ 2026-11-14：用户可选 1500/2000/2500/3000 四档 → 最坏 = 3000 + 300(逐台延迟)
+    //   + 160(预缓冲) = 3460ms，需要 ≥ 512 槽（5120ms）。每槽 1920B，512 槽 ≈ 960KB/流，
+    //   盒子内存扛得住；留 1660ms 余量给漂移堆积和"压延迟丢帧"的阈值带宽。
+    private static final int SLOTS = 512;
+    private static final int MASK = SLOTS - 1;
+    /** 缓冲积到"目标 + 80ms"就主动丢一帧把延迟拉回来（两端音频时钟有 ppm 级漂移，不校正会越积越多）。 */
+    private static final int DROP_ABOVE_EXTRA_MS = 80;
+
+    /**
+     * ★ 2026-11-13 真机取证（这次终于抓到根因）：
+     *   两台盒子 logcat 刷屏 {@code AudioTrack: releaseBuffer() track ... disabled due to
+     *   previous underrun, restarting}（154 记 162 次 / 142 记 89 次），而同一次接收的
+     *   统计是「收 59403 丢 0 迟到 0 坏包 0」—— 网络层一个包没丢，剪帧一次没触发。
+     *   所以「卡 / 越来越快」既不是抖动缓冲参数、也不是同步模式，而是【播放输出层欠载】：
+     *   openTrack 给的容量虽有 24576 字节（128ms），但 play() 时缓冲是空的，mixLoop
+     *   每 10ms 才喂一帧 —— 实际水位只有约 10ms。盒子一次 GC / 调度停顿就欠载，
+     *   AudioFlinger 重启混音通道时跳数据，听感就是「卡 + 忽快」。
+     *
+     *   <p>修法（不再调接收参数，前面几版全在改错地方）：
+     *   <br>① 输出缓冲容量固定 16 帧（160ms），不再跟各机 minBuf 走 —— 各机一致，顺带同步更齐；
+     *   <br>② play() 前先预填 10 帧静音（100ms 水位），从此输出层始终有 100ms 余量，
+     *      Java 线程即便停顿 100ms 也不欠载；恢复后 write 不阻塞地把水位补回，音频时钟匀速；
+     *   <br>③ 不再请求 PERFORMANCE_MODE_LOW_LATENCY（FAST 通道缓冲小、更易欠载）。
+     *
+     *   <p>代价：整体声音往后挪 100ms。用户明确「延迟不要求实时，最重要是别卡」，且各机一致。
+     */
+    // ★ 2026-11-14（真机取证）：154 在 320ms 输入缓冲下 85 秒仍偶发 1 次卡，日志是
+    //   `AudioFlinger: BUFFER TIMEOUT` + `AudioTrack: releaseBuffer ... previous underrun`
+    //   —— 输出层被抽干，不是输入侧丢包（同期 ReasmFails 才 2）。320ms 输入抖动缓冲
+    //   治不了"混音线程停顿一下就把 AudioTrack 抽干"。所以把【输出层】余量加大：
+    //   容量 160→320ms、预填 100→200ms，给混音线程 200ms 的停顿容忍（GC/调度抖动都不怕）。
+    //   代价：再晚出 100ms，用户明确接受（不卡第一）。
+    private static final int TRACK_BUFFER_FRAMES = 32;    // 320ms 容量
+    private static final int TRACK_PREFILL_FRAMES = 20;   // 200ms 起始水位
+    /** 单台设备可加的延迟上限（毫秒）：只用来对齐「谁先出声」，不治卡。 */
+    public static final int MAX_EXTRA_DELAY_MS = 300;
+    /**
+     * 预缓冲允许比目标深度多攒多少毫秒。
+     *
+     * <p>老代码写的是 {@code (SLOTS - 4) * 10}：32 槽时正好 280 = 120 目标 + 160 余量。
+     * 槽位翻到 64 后这个式子会变成 600ms —— 开局突发时先攒半秒才出声，是实打实的退化。
+     * 所以把"余量"单独写成常量：默认行为与改动前逐字一致，只有加了延迟才按需抬高。
+     */
+    private static final int PREBUF_EXTRA_MS = 160;
+    /** 这么久没有新包就把这条流摘掉（对端关掉了/走了）。 */
+    private static final int STREAM_IDLE_MS = 3000;
+    /** 收包缓冲区：一包 28 + 1920 = 1948 字节，4096 留足余量。 */
+    private static final int RECV_BUF = 4096;
+    private static final float PEAK_DECAY = 0.82f;
+    /** PONG 包的 ssrc：固定一个，对端的日志/诊断里好认。 */
+    private static final int PONG_SSRC = 0x506F6E67;   // "Pong"
+
+    /**
+     * 对端发来的统计包（{@code ptype=7 T_STATS}）回调：两台设备"自己交流"的入口。
+     *
+     * <p><b>回调跑在收包线程上</b>：实现里只许做"解析 + 存起来"这种微秒级的事
+     * （见 {@link Engine} 的实现），绝不能在这里发网络请求或者碰界面。
+     * 就算实现里抛了异常也影响不到收包 —— 调用处套了 try/catch。
+     */
+    public interface StatsListener {
+        void onStats(String host, byte[] payload);
+    }
+
+    /** 谁想知道对端统计就设进来；为 null 表示不需要（默认）。 */
+    private volatile StatsListener statsListener;
+
+    public void setStatsListener(StatsListener l) {
+        statsListener = l;
+    }
+
+    /**
+     * 实际绑定的音频端口和请求值不同时回调。
+     *
+     * <p>★ 2026-11-02：默认音频端口被别的 App 占用时，原来只记一句日志就退出，
+     * 信标里还公布旧端口，对端按旧端口发来的包全丢。现在这里换空闲口重试，
+     * 并把实际端口交给 Engine 同步到信标。
+     */
+    public interface PortListener {
+        void onPortChanged(int oldPort, int newPort);
+    }
+
+    private volatile PortListener portListener;
+
+    public void setPortListener(PortListener l) {
+        portListener = l;
+    }
+
+    // ═══════════════ ★ 2026-11-17 NACK 缺包回请求（可切换，默认关闭） ═══════════════
+    /**
+     * 发现自己缺了包时回调（收包线程上）。实现里必须只做"把 seq 列表发出去"这种快活，
+     * 且要经发现层控制通道，绝不能在这里碰 AudioTrack/界面。
+     *
+     * @param host        缺包来自哪台（就是它的 IP，回请求要发给它）
+     * @param missingSeqs 缺失的 seq 列表（uint16）
+     */
+    public interface NackListener {
+        void onMissing(String host, int[] missingSeqs);
+    }
+    private volatile NackListener nackListener;
+    private volatile boolean nackEnabled = false;
+    public void setNackListener(NackListener l) { nackListener = l; }
+    public void setNackEnabled(boolean on) { nackEnabled = on; }
+
+    /** 攒缺包用的缓冲区（收包线程专用，不跨线程）：最多 64 个 seq 一批。 */
+    private final int[] nackGapBuf = new int[64];
+    private int nackGapCount = 0;
+    private long nackLastSendMs = 0;
+    /** 两次缺包请求的最小间隔（毫秒），防止一次长丢包刷屏式发请求。 */
+    private static final long NACK_MIN_INTERVAL_MS = 20;
+    /** 单个断层最多请求多少个 seq（超过就不是普通丢包，是被打穿了，请求也没用）。 */
+    private static final int NACK_MAX_GAP = 96;
+
+    /** ★ 2026-11-17：诊断计数——本机共发起过多少批补包请求 / 请求了多少个 seq。 */
+    private volatile long nackReqBatches;
+    private volatile long nackReqSeqs;
+    public long nackReqBatches() { return nackReqBatches; }
+    public long nackReqSeqs() { return nackReqSeqs; }
+
+    /** 把一个缺失的 seq 攒进本批（收包线程调用）。 */
+    private void noteNackGap(int seq) {
+        if (nackGapCount >= nackGapBuf.length) {
+            flushNack(null);   // 攒满了先发一批，host 用下面的最新值补
+        }
+        nackGapBuf[nackGapCount++] = seq;
+    }
+
+    /**
+     * 把攒下的缺包 seq 发回发送端（收包线程调用，必须快）。
+     * host 传 null 时用最近一次的来源 host（攒满分批的那种情况）。
+     */
+    private void flushNack(String host) {
+        if (nackGapCount == 0) {
+            return;
+        }
+        NackListener l = nackListener;
+        long now = SystemClock.elapsedRealtime();
+        // 间隔限流：太密集就先丢掉这一小批（下一批新包还会再带上，不会永久漏）。
+        if (l == null || !nackEnabled || now - nackLastSendMs < NACK_MIN_INTERVAL_MS) {
+            nackGapCount = 0;
+            return;
+        }
+        int[] missing = java.util.Arrays.copyOf(nackGapBuf, nackGapCount);
+        String to = (host == null || host.isEmpty()) ? lastFromHost : host;
+        nackGapCount = 0;
+        nackLastSendMs = now;
+        nackReqBatches++;
+        nackReqSeqs += missing.length;
+        try {
+            l.onMissing(to, missing);
+        } catch (Throwable t) {
+            Log.w(TAG, "NACK 缺包回调异常（已忽略）：" + t);
+        }
+    }
+
+    /** 收包统计，给界面"详情"用。 */
+    public static final class Stats {
+        public long received;
+        public long lost;
+        public long late;
+        public long duplicates;
+        public long badPackets;
+        public long filtered;
+        public long controls;
+        public long recoveries;
+        public long trackErrors;
+        public int streamCount;
+        /** 当前缓冲深度（毫秒，取最大的那条流）。 */
+        public int bufferedMs;
+        public int targetMs;
+        /** 混音输出峰值 0~1（不受本机音量滑杆影响）。 */
+        public float peak;
+        public List<StreamStats> streams = Collections.emptyList();
+
+        // ── ★ 坏包按原因分类（2026-10-12 真机反馈）──
+        // 原来只有一个"坏包 3220"的总数、报告里只解释了其中 49 个，剩下 3171 个只能猜。
+        // "有数字没线索"是排查里最难受的状态，所以每一类都单独计数 + 留一个现场样本。
+        /** magic 不对：根本不是我们的协议（别人的广播、扫描器、别的 App 的流量）。 */
+        public long badMagic;
+        /** 版本号不是 1（将来协议升级时能一眼看出来）。 */
+        public long badVersion;
+        /** 连 28 字节包头都不够（被截断）。 */
+        public long badShort;
+        /** 是我们的包，但编码不是 PCM16（手机只有 PCM16，Opus/浮点都解不了）。 */
+        public long badCodec;
+        /** 是我们的 PCM16 包，但帧长不是 480 帧这一档。 */
+        public long badFrames;
+        /** 各类最近一个坏包的现场（人话，直接抄进诊断报告）。 */
+        public String lastMagicSample = "";
+        public String lastVersionSample = "";
+        public String lastShortSample = "";
+        public String lastCodecSample = "";
+        public String lastFramesSample = "";
+        /** 最近见过的编码值（"codec=3(Opus)"）：判断"对面到底用什么编码发的"最直接的证据。 */
+        public String lastCodecSeen = "";
+        /**
+         * ★ 坏包来源前几名（"192.168.0.109 3171 个"）。
+         *
+         * <p>这一条把"是某一台设备在按我们不懂的方式发"和"整个网段的噪声都在往这个端口灌"
+         * 彻底分开 —— 后者通常说明这个端口号被别的软件占了/被扫了。
+         */
+        public String badBySource = "";
+        /**
+         * ★ 坏包长度分布前几名（"1948 字节 3171 个"）。
+         *
+         * <p>长度是最便宜也最有效的"指纹"：<b>1948 字节</b>正好是"28 字节包头 + 480 帧 PCM16"
+         * 的长度 —— 如果坏包全是这个长度，那它几乎肯定是一条<b>音频流</b>（只是头不对/编码不对）；
+         * 如果长度是 60/200/1200 这种零碎的，那就是网络里别人的杂流量。
+         * 有了这一条，"3171 个坏包到底是什么"就不必再猜。
+         */
+        public String badByLen = "";
+        /** ★ 被抑制掉的"同一台设备第 2 条流"的包数（去重生效的证据）。 */
+        public long dupRoutePackets;
+        /** 其中"内容指纹确认是同一份声音"的包数（>0 = 确认是同一音源从两条路进来）。 */
+        public long dupRouteConfirmed;
+        /** 现场描述：谁的哪两条 ssrc 在打架。 */
+        public String dupRouteText = "";
+        /**
+         * ★ 对面报的 samples 和负载长度对不上的次数（包照收，不算坏包）。
+         * 电脑端历史版本填的是累计帧偏移，就靠这一条看出来。
+         */
+        public long samplesMismatch;
+        /** 这件事最近一次的现场（人话）。 */
+        public String lastSamplesNote = "";
+        /** ★ 2026-11-04（B 第一阶段）：自回声丢弃 / 超跳丢弃（诊断页要显示）。 */
+        public long echoDropped;
+        public long hopDropped;
+
+        @Override
+        public String toString() {
+            String s = "收 " + received + " 丢 " + lost + " 迟到 " + late + " 坏包 " + badPackets
+                    + " 流 " + streamCount + " 缓冲 " + bufferedMs + "ms";
+            if (echoDropped > 0 || hopDropped > 0) {
+                s += " · 自回声丢弃 " + echoDropped + " · 超跳丢弃 " + hopDropped;
+            }
+            return s;
+        }
+    }
+
+    /** 单条发送方的状态。 */
+    public static final class StreamStats {
+        public int ssrc;
+        public String host = "";
+        public long received;
+        public long lost;
+        /** ★ 2026-11-17 晚：这条流累计收到的<字节数>（监控页要看"接收多少 M"）。 */
+        public long bytes;
+        public int bufferedMs;
+        public float peak;
+        public long ageMs;
+    }
+
+    // ══════════════════ ★ 同一台设备只让一条流出声（去重） ══════════════════
+    //
+    // 为什么必须去重（2026-10-12 真机反馈，用户原话「路由模式和广播模式有些许混淆了」）：
+    // 电脑同时开着「广播」和「点对点路由」时，**同一份声音会从两条路各来一份**，而两条路的
+    // ssrc 不一样（电脑端 ssrc = crc32(node_id|route_id)），在接收端就是两条独立的流 ——
+    // 叠加播放的结果是音量翻倍 + 两路的时序差打架（梳状滤波），听感就是"糊、忽大忽小"。
+    //
+    // 音频包里没有路由 id（电脑端协议注释写得很清楚：An audio packet carries no route id），
+    // 所以接收端没法问"你是哪条路由"。能站得住的判据只有一条：**一台设备同一时刻只播一条流**。
+    // 它同时也能兜住"同一个 ssrc 被两个 socket 收到"这种更少见的情况。
+    //
+    // 代价（必须说清楚，不藏着）：如果某一台设备<b>故意</b>同时给你送两路不同的声音
+    //   （比如电脑的系统声音 + 电脑的麦克风），这里只会播其中一路 —— 另一路会被抑制，
+    //   并在诊断报告里写明"抑制了谁"。宁可少一路，也不要叠着放把音量翻倍。
+    /** 每台设备当前允许出声的那条流（ssrc）。只由收包线程读写。 */
+    private final Map<String, Integer> hostActiveSsrc = new HashMap<>();
+    /** 被抑制掉的重复流包数 / 其中"内容指纹确认是同一份声音"的包数。 */
+    private volatile long dupRoutePackets;
+    private volatile long dupRouteConfirmed;
+    /** 现场描述（诊断报告直接用）。 */
+    private volatile String dupRouteText = "";
+    /** 指纹历史：只用来"确认"两条流是不是同一份声音，不参与"是否抑制"的判定。 */
+    private static final int FP_HISTORY = 64;
+    private static final int FP_WINDOW_MS = 120;
+    private final int[] fpValue = new int[FP_HISTORY];
+    private final int[] fpSsrc = new int[FP_HISTORY];
+    private final String[] fpHost = new String[FP_HISTORY];
+    private final long[] fpAt = new long[FP_HISTORY];
+    private int fpIdx;
+
+    private final Context appCtx;
+    /** 端口不是 final：界面层可以"先建对象、启动时再定端口"（要先探测空闲端口就得这么用）。 */
+    private volatile int port;
+    private final Object lifeLock = new Object();
+    private final Object allowLock = new Object();
+    /** 只由收包线程添加；播放线程只做移除，所以用写时复制的列表在热路径上零加锁。 */
+    private final CopyOnWriteArrayList<Stream> streams = new CopyOnWriteArrayList<>();
+    /** 空 = 全收（还没勾任何人时"打开就能听"）；一旦用户动过开关，就只播明确打开的那些。 */
+    private final Map<String, Boolean> allowed = new HashMap<>();
+
+    private volatile boolean running;
+    private Thread rxThread;
+    private Thread mixThread;
+    private volatile DatagramSocket socket;
+    private volatile AudioTrack track;
+    private volatile boolean trackPlaying;
+    // ★ 2026-11-14：速率匹配（PlaybackParams 微调速度）已按用户要求删除 —— 实测无漂移、无差别。
+    /** EventLog 每 5 秒缓冲快照的节流时间戳。 */
+    private long lastSnapMs = 0;
+    private WifiManager.WifiLock wifiLock;
+
+    private volatile int targetMs = DEFAULT_TARGET_MS;
+    // ★ 2026-11-04（B 第一阶段）：本机 originId（device_id 哈希），用于丢"绕回来的自回声"。
+    private volatile int selfOriginId = 0;
+    private volatile long echoDropped;
+    private volatile long hopDropped;
+    private volatile float gain = 1f;
+    private volatile float peak;
+    private volatile String lastError = "";
+
+    // ── ★ 合并版：左右声道 ──────────────────────────────────────────────
+    // 全局输出矩阵（模式 / 平衡 / 左右独立音量）。volatile 字段在 ChannelRouter 内部，
+    // 界面线程改、混音线程每 10ms 读一次，不需要额外加锁。
+    private final ChannelRouter channelRouter = new ChannelRouter();
+    /** 每台来源设备分配到哪只耳朵：host → 0 双 / 1 左 / 2 右。写时复制，收包线程无锁读。 */
+    private volatile Map<String, Integer> hostChannel = Collections.emptyMap();
+
+    // received,lost,late,dup,bad,filtered,controls,recoveries,
+    // 8..12 = ★ 坏包分类：magic / version / 太短 / 编码不是 PCM16 / 帧长不对
+    private final long[] counters = new long[16];
+    private volatile long trackErrors;
+    private int ssrcSeen;
+    /**
+     * ★ 坏包现场样本的节流表：<b>每一类各自节流</b>。
+     *
+     * <p>为什么不能用一个全局节流：真机上往往是好几种坏包混在一起（这次就是）。
+     * 全局节流会让"先到的那一类"把后面每一类的样本都吞掉 —— 结果报告里只有一类的现场，
+     * 剩下的还是只能猜。分开之后每一类都能立刻留下自己的第一条现场。
+     */
+    private final long[] lastSampleMs = new long[6];
+    // ★ 坏包现场样本（收包线程写、界面线程读，所以是 volatile）
+    private volatile String lastMagicSample = "";
+    private volatile String lastVersionSample = "";
+    private volatile String lastShortSample = "";
+    private volatile String lastCodecSample = "";
+    private volatile String lastFramesSample = "";
+    /** 最近见过的编码（"codec=3（Opus…）"）：判断对面用什么编码发的最直接的证据。 */
+    private volatile String lastCodecSeen = "";
+    /**
+     * ★ 对面报的 samples 和负载长度对不上的次数 + 最近一次的现场。
+     *
+     * <p>这不是错误计数（包照收照播），而是"对方那个字段语义不同"的证据 ——
+     * 电脑端历史版本把 samples 填成累计帧偏移，就是靠这两条看出来的。
+     */
+    private volatile long samplesMismatch;
+    private volatile String lastSamplesNote = "";
+    /**
+     * ★ 坏包按来源 IP 计数（只由收包线程写，读的时候拿 counters 锁）。
+     * 上限 8 个来源：局域网里不会有更多，防的是被人乱刷撑爆内存。
+     */
+    private final Map<String, Long> badBySource = new java.util.LinkedHashMap<>();
+    /** ★ 坏包按"整包长度"计数（同一个上限策略：只留最近 8 种长度）。 */
+    private final Map<Integer, Long> badByLen = new java.util.LinkedHashMap<>();
+
+    /** 用默认端口 47831。 */
+    public AudioRecv() {
+        this(null, Proto.DEFAULT_AUDIO_PORT);
+    }
+
+    public AudioRecv(int port) {
+        this(null, port);
+    }
+
+    /**
+     * 带 Context 的版本会拿 {@code WifiLock}：不收包的时候 Wi-Fi 会进省电模式，
+     * 包被攒到 DTIM 周期才一起送上来，抖动缓冲会被瞬间冲垮（听感就是周期性的卡顿）。
+     */
+    public AudioRecv(Context context, int port) {
+        this.appCtx = context == null ? null : context.getApplicationContext();
+        this.port = port > 0 ? port : Proto.DEFAULT_AUDIO_PORT;
+    }
+
+    // ------------------------------------------------------------------ 对外
+
+    /** 开始接收并播放（用构造时定的端口）；重复调用无副作用。 */
+    public void start() {
+        start(port);
+    }
+
+    /**
+     * 开始接收并播放，并在这里定下端口。
+     *
+     * <p>建 socket / 建 AudioTrack 都在工作线程里完成，所以这个方法立刻返回 ——
+     * 主线程不会被 bind 或者音频设备初始化卡住。
+     */
+    public void start(int port) {
+        synchronized (lifeLock) {
+            if (running) {
+                return;
+            }
+            if (port > 0) {
+                this.port = port;
+            }
+            running = true;
+            rxThread = new Thread(this::rxLoop, "am-audio-rx");
+            mixThread = new Thread(this::mixLoop, "am-audio-mix");
+            rxThread.setDaemon(true);
+            mixThread.setDaemon(true);
+            rxThread.start();
+            mixThread.start();
+        }
+    }
+
+    public void stop() {
+        Thread r;
+        Thread m;
+        synchronized (lifeLock) {
+            if (!running && rxThread == null && mixThread == null) {
+                return;
+            }
+            running = false;
+            r = rxThread;
+            m = mixThread;
+            rxThread = null;
+            mixThread = null;
+        }
+        DatagramSocket s = socket;
+        if (s != null) {
+            s.close();   // 关掉 socket 才能把阻塞在 receive 的线程叫醒
+        }
+        AudioTrack t = track;
+        if (t != null) {
+            try {
+                t.pause();
+                t.flush();
+            } catch (Throwable ignored) {
+            }
+        }
+        if (r != null && r != Thread.currentThread()) {
+            try {
+                r.join(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        if (m != null && m != Thread.currentThread()) {
+            try {
+                m.join(1500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        streams.clear();
+        releaseTrack();
+        releaseWifiLock();
+        peak = 0f;
+    }
+
+    public boolean isRunning() {
+        return running;
+    }
+
+    /**
+     * 只收听某一台（界面上的「收听」开关）。没勾过任何人时是全收，
+     * 这样"打开 App 就出声"；一旦勾过，就只播明确打开的那些，语义清楚不会两头猜。
+     */
+    public void allow(String host, boolean on) {
+        if (host == null || host.isEmpty()) {
+            return;
+        }
+        synchronized (allowLock) {
+            allowed.put(host, on);
+        }
+    }
+
+    /** 清空名单，回到"全收"。 */
+    public void clearAllowed() {
+        synchronized (allowLock) {
+            allowed.clear();
+        }
+    }
+
+    private boolean isAllowed(String host) {
+        synchronized (allowLock) {
+            if (allowed.isEmpty()) {
+                return true;
+            }
+            Boolean v = allowed.get(host);
+            return v != null && v;
+        }
+    }
+
+    /**
+     * 「我们这一层」的播放增益 0.0~1.0：用 {@code AudioTrack.setVolume}，不动样本（省一次 960 次乘法）。
+     *
+     * <p>注意它<b>只影响我们这条 AudioTrack</b>，绝不碰系统媒体音量 —— 用户明确要求过：
+     * 三层是"系统音量 × 播放器自己的音量 × 我们这一层"，我们只负责最后一层。
+     */
+    public void setGain(float g) {
+        gain = Math.max(0f, Math.min(1f, g));
+        AudioTrack t = track;
+        if (t != null) {
+            try {
+                t.setVolume(gain);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /** {@link #setGain(float)} 的同义词：界面层管这个叫"音量"，名字顺着它更好接。 */
+    public void setVolume(float v) {
+        setGain(v);
+    }
+
+    public float gain() {
+        return gain;
+    }
+
+    /** 抖动缓冲目标毫秒数（100~200）。 */
+    public int targetBufferMs() {
+        return targetMs;
+    }
+
+    /** ★ 2026-11-04（B 第一阶段）：本机 originId；和电脑端 Receiver 的 self_origin_id 同义。 */
+    public void setSelfOriginId(int originId) {
+        this.selfOriginId = originId;
+    }
+
+    public void setTargetBufferMs(int ms) {
+        targetMs = Math.max(MIN_TARGET_MS, Math.min(MAX_TARGET_MS, ms));
+    }
+
+    public int port() {
+        return port;
+    }
+
+    /** 混音输出峰值 0~1，界面画总电平用。 */
+    public float peak() {
+        return peak;
+    }
+
+    /** 当前在收的流数量（用来显示"已连接几台"）。 */
+    public int streamCount() {
+        return streams.size();
+    }
+
+    public String lastError() {
+        return lastError;
+    }
+
+    /** 收包/丢包/缓冲深度的快照。界面按 10Hz 调也没问题（只在堆上拼一个小对象）。 */
+    public Stats stats() {
+        Stats st = new Stats();
+        synchronized (counters) {
+            st.received = counters[0];
+            st.lost = counters[1];
+            st.late = counters[2];
+            st.duplicates = counters[3];
+            st.badPackets = counters[4];
+            st.filtered = counters[5];
+            st.controls = counters[6];
+            st.recoveries = counters[7];
+            st.badShort = counters[8];
+            st.badMagic = counters[9];
+            st.badVersion = counters[10];
+            st.badCodec = counters[11];
+            st.badFrames = counters[12];
+            st.echoDropped = echoDropped;
+            st.hopDropped = hopDropped;
+            // ★ 坏包来源前 3 名：把"某一台在乱发"和"整个网段的噪声"分开。
+            if (!badBySource.isEmpty()) {
+                java.util.List<Map.Entry<String, Long>> list = new ArrayList<>(badBySource.entrySet());
+                // ★ 2026-11-12：List.sort 是 API 24 的，5.1 上用 Collections.sort。
+                java.util.Collections.sort(list, new java.util.Comparator<Map.Entry<String, Long>>() {
+                    @Override
+                    public int compare(Map.Entry<String, Long> a, Map.Entry<String, Long> b) {
+                        return Long.compare(b.getValue(), a.getValue());
+                    }
+                });
+                StringBuilder bs = new StringBuilder(64);
+                for (int i = 0; i < list.size() && i < 3; i++) {
+                    if (bs.length() > 0) {
+                        bs.append(" · ");
+                    }
+                    bs.append(list.get(i).getKey()).append(' ').append(list.get(i).getValue()).append(" 个");
+                }
+                st.badBySource = bs.toString();
+            }
+            // ★ 长度分布：1948 字节（28 头 + 480 帧 PCM16）= 一条音频流的形状；
+            //   零碎长度 = 网络里别人的杂流量。
+            if (!badByLen.isEmpty()) {
+                java.util.List<Map.Entry<Integer, Long>> list = new ArrayList<>(badByLen.entrySet());
+                java.util.Collections.sort(list, new java.util.Comparator<Map.Entry<Integer, Long>>() {
+                    @Override
+                    public int compare(Map.Entry<Integer, Long> a, Map.Entry<Integer, Long> b) {
+                        return Long.compare(b.getValue(), a.getValue());
+                    }
+                });
+                StringBuilder bs = new StringBuilder(64);
+                for (int i = 0; i < list.size() && i < 3; i++) {
+                    if (bs.length() > 0) {
+                        bs.append(" · ");
+                    }
+                    bs.append(list.get(i).getKey()).append(" 字节 ").append(list.get(i).getValue()).append(" 个");
+                }
+                st.badByLen = bs.toString();
+            }
+        }
+        st.lastMagicSample = lastMagicSample;
+        st.lastVersionSample = lastVersionSample;
+        st.lastShortSample = lastShortSample;
+        st.lastCodecSample = lastCodecSample;
+        st.lastFramesSample = lastFramesSample;
+        st.lastCodecSeen = lastCodecSeen;
+        st.dupRoutePackets = dupRoutePackets;
+        st.dupRouteConfirmed = dupRouteConfirmed;
+        st.dupRouteText = dupRouteText;
+        st.samplesMismatch = samplesMismatch;
+        st.lastSamplesNote = lastSamplesNote;
+        st.trackErrors = trackErrors;
+        st.targetMs = targetMs;
+        st.peak = peak;
+        long now = SystemClock.elapsedRealtime();
+        List<StreamStats> list = new ArrayList<>(streams.size());
+        int maxBuf = 0;
+        long streamLost = 0;
+        for (Stream s : streams) {
+            StreamStats ss = new StreamStats();
+            ss.ssrc = s.ssrc;
+            ss.host = s.host;
+            ss.received = s.received;
+            ss.lost = s.lost;
+            ss.bytes = s.bytesReceived;
+            ss.bufferedMs = s.depthSnapshotMs;   // ★ 读快照，不抢播放线程的锁
+            ss.peak = s.peak;
+            ss.ageMs = now - s.lastPacketMs;
+            if (ss.bufferedMs > maxBuf) {
+                maxBuf = ss.bufferedMs;
+            }
+            streamLost += s.lost;
+            list.add(ss);
+        }
+        st.streamCount = list.size();
+        st.bufferedMs = maxBuf;
+        st.streams = list;
+        // 顶部这行原来只报 counters[1]，而真正的"播放时跳过了多少帧"记在每条流里
+        // （丢包/补静音/压延迟都算），于是出现过"上面写丢 0、下面写丢 5908"的怪相。
+        // 真机排查时这个数字是最关键的线索，必须报真实值。
+        if (streamLost > st.lost) {
+            st.lost = streamLost;
+        }
+        return st;
+    }
+
+    /**
+     * 找一个能用的音频端口（47831 被别的进程占了就换）。
+     *
+     * <p><b>必须在工作线程调用</b>：它会真的 bind 一次 socket，而安卓禁止主线程碰网络。
+     * 只是探测，探完立刻关掉 —— 正式收包由 {@link #start()} 在后台重新绑。
+     */
+    public static int pickFreePort(int preferred) {
+        int start = preferred > 0 ? preferred : Proto.DEFAULT_AUDIO_PORT;
+        for (int p = start; p < start + 20 && p < 65535; p++) {
+            try (DatagramSocket probe = new DatagramSocket(null)) {
+                probe.setReuseAddress(false);
+                probe.bind(new InetSocketAddress(p));
+                return p;
+            } catch (IOException e) {
+                // 被占了，试下一个
+            }
+        }
+        return -1;      // ★ 一个都没找到：调用方必须如实报错，不能假装用的是 preferred
+    }
+
+    // -------------------------------------------------------------- 收包线程
+
+    /**
+     * ★ 2026-11-13（软件端优化①）：把当前线程提到 Android 音频实时优先级
+     *   （{@code THREAD_PRIORITY_AUDIO}=-16）。2.40 之后越来越卡的元凶之一：
+     *   收/播两条音频线程一直跑在默认优先级，弱盒子（S905L3A）上被系统后台、
+     *   UI 重绘、GC 抢来抢去，10ms 一趟的播放循环被顶掉 → AudioTrack 欠载刷屏。
+     *   这一句零成本、零风险，直接让音频线程在调度器里排到最前。
+     */
+    private static void setAudioThreadPriority() {
+        try {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void rxLoop() {
+        setAudioThreadPriority();
+        acquireWifiLock();
+        DatagramSocket s = null;
+        IOException lastBindError = null;
+        int want = port;
+        // 默认端口可能被别的 App 占着：逐個试下一个空闲口（最多 6 次）。
+        // 不在这里退出 —— 退出的表现是"界面显示已收听、但 0 个流"，最难查。
+        for (int attempt = 0; attempt < 6 && running; attempt++) {
+            DatagramSocket cand = null;
+            try {
+                cand = new DatagramSocket(null);   // 先建不绑，才能先设 reuse/缓冲再绑
+                cand.setReuseAddress(true);
+                try {
+                    cand.setReceiveBufferSize(256 * 1024);   // 一次 GC/调度停顿可能积压几十个包
+                } catch (IOException ignored) {
+                }
+                cand.bind(new InetSocketAddress(want));
+                s = cand;
+                lastBindError = null;
+                if (want != port) {
+                    int old = port;
+                    port = want;
+                    Log.i(TAG, "音频端口 " + old + " 被占用，改用 " + want);
+                    PortListener l = portListener;
+                    if (l != null) {
+                        try {
+                            l.onPortChanged(old, want);
+                        } catch (Throwable t) {
+                            Log.w(TAG, "通知新音频端口失败：" + t);
+                        }
+                    }
+                }
+                break;
+            } catch (IOException e) {
+                lastBindError = e;
+                if (cand != null) {
+                    try {
+                        cand.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+                int next = want + 1;
+                int free = pickFreePort(next);
+                if (free < 0) {
+                    break;
+                }
+                want = free;
+            }
+        }
+        if (s == null) {
+            note("音频端口 " + port + " 打不开（被占用？）：" + lastBindError);
+            running = false;
+            releaseWifiLock();       // ★ 绑定失败也要放锁，不能把 Wi-Fi 锁留在后台
+            return;
+        }
+        try {
+            s.setSoTimeout(500);
+        } catch (IOException ignored) {
+        }
+        socket = s;
+        if (running) {
+            Log.i(TAG, "开始接收：0.0.0.0:" + port + " 抖动目标 " + targetMs + "ms");
+            EventLog.log("RX", "开始 port=" + port + " target=" + targetMs + "ms");
+        }
+        byte[] buf = new byte[RECV_BUF];
+        DatagramPacket p = new DatagramPacket(buf, buf.length);
+        try {
+            while (running) {
+                try {
+                    p.setLength(buf.length);
+                    s.receive(p);
+                    onPacket(buf, p.getLength(), p.getAddress(), p.getPort());
+                } catch (SocketTimeoutException te) {
+                    // 正常：用超时让循环有机会看到 running 变 false
+                } catch (IOException e) {
+                    if (!running) {
+                        break;
+                    }
+                    // 网卡抖动时 UDP socket 也可能报错，歇一下继续，绝不能退出线程
+                    sleepQuiet(50);
+                } catch (Throwable t) {
+                    note("收包异常：" + t);
+                    sleepQuiet(50);
+                }
+            }
+        } finally {
+            try {
+                s.close();
+            } catch (Throwable ignored) {
+            }
+            if (socket == s) {
+                socket = null;
+            }
+            Log.i(TAG, "接收结束：" + stats());
+            EventLog.log("RX", "停止 " + stats());
+        }
+    }
+
+    /** ★ 2026-11-13（软件端优化③）：收包热路径复用的包头对象，绝不每包 new。 */
+    private final Proto.Pkt scratchPkt = new Proto.Pkt(0);
+    /** ★ 2026-11-14 收包热路径的 host 字符串缓存（同一发送端连续包不重复分配 String）。 */
+    private InetAddress lastFromAddr;
+    private String lastFromHost = "";
+
+    /**
+     * ★ 2026-11-14（用户：「3000ms 还是会动不动卡一下，你分析」）看门狗。
+     *
+     * <p>为什么加：之前所有结论都建立在"日志里没有 underrun/重置"上，但那只能证明
+     * 播放层没被抽干，**证明不了音频内容本身是连续的**。真正能定性的是两个数：
+     * <ul>
+     *   <li>{@link #maxArriveGapMs} —— 相邻两个 UDP 包的最大到达间隔。10ms 一包，
+     *       突然冒出 200~500ms 的空档 = Wi-Fi/发送端断供；</li>
+     *   <li>每条流的 收/丢/迟到/重复 增量 —— 区分"没到"和"到了但被丢"。</li>
+     * </ul>
+     * 每 2 秒打一条 {@code [RX]}，由设备端 {@code logcat -f} 落盘（不依赖 adb 长连）。
+     */
+    private volatile long lastArriveMs = 0;
+    private volatile int maxArriveGapMs = 0;
+    private long lastStatLogMs = 0;
+
+    private void onPacket(byte[] buf, int len, InetAddress from, int fromPort) {
+        // ★ 看门狗：只统计"包到没到"，不参与任何播放决策。
+        long arriveNow = SystemClock.elapsedRealtime();
+        long prevArrive = lastArriveMs;
+        if (prevArrive > 0) {
+            int gap = (int) (arriveNow - prevArrive);
+            if (gap > maxArriveGapMs) {
+                maxArriveGapMs = gap;
+            }
+        }
+        lastArriveMs = arriveNow;
+        // 来源地址先解析出来：下面每个分支（包括坏包分类）都要用它，只算一次。
+        String host;
+        if (from != null && from.equals(lastFromAddr)) {
+            host = lastFromHost;
+        } else {
+            host = normalizeHost(from);
+            lastFromAddr = from;
+            lastFromHost = host;
+        }
+        // ★ 坏包原因分类（2026-10-12 真机反馈）：只有一个"坏包 3220"的总数查不出任何东西，
+        //   所以在丢掉之前先分清"为什么丢"，每一类各留一个现场样本。
+        //   注意：这里只是只读地看一眼包头，不改动 Proto（那个类和电脑端逐字节对过）。
+        if (len < Proto.HEADER_SIZE) {
+            bumpBad(8, host, len);
+            sampleBad(1, buf, len, from, "长度 " + len + " 字节，连 28 字节包头都不够");
+            return;
+        }
+        int magic = (buf[0] & 0xFF) | ((buf[1] & 0xFF) << 8);
+        if (magic != Proto.MAGIC) {
+            bumpBad(9, host, len);
+            sampleBad(2, buf, len, from, "magic=0x" + Integer.toHexString(magic)
+                    + "（我们的是 0x" + Integer.toHexString(Proto.MAGIC) + "）");
+            return;
+        }
+        int ver = buf[2] & 0xFF;
+        if (ver != Proto.VERSION) {
+            bumpBad(10, host, len);
+            sampleBad(3, buf, len, from, "version=" + ver + "（我们的是 " + Proto.VERSION + "）");
+            return;
+        }
+        Proto.Pkt pkt = scratchPkt;
+        int payloadStart = Proto.decodeInto(buf, 0, len, pkt, null);
+        if (payloadStart < 0) {
+            // magic 和版本都对、长度也够，decode 不该失败；真出现了也不能掩盖。
+            bumpBad(0, host, len);
+            sampleBad(0, buf, len, from, "包头能认出来但解码失败");
+            return;
+        }
+        // ★ 2026-11-04（B 第一阶段）防自环，先于任何流/白名单判据：
+        //   ① originId == 本机 → 这是自己的声音绕了一圈回来，绝不能播，计数后丢弃；
+        //   ② hop > MAX_HOP → 已经在网里转了太多跳，继续传只会放大环。
+        //   老电脑没有扩展段（originId=0）→ 两条都不触发，老路径原样。
+        if (pkt.type == Proto.T_AUDIO && pkt.originId != 0) {
+            if (selfOriginId != 0 && pkt.originId == selfOriginId) {
+                echoDropped++;
+                if (echoDropped % 50 == 1) {
+                    note("丢弃自回声帧（originId == 本机）累计 " + echoDropped + " 个");
+                }
+                return;
+            }
+            if (pkt.hop > Proto.MAX_HOP) {
+                hopDropped++;
+                return;
+            }
+        }
+        if (pkt.type != Proto.T_AUDIO) {
+            bump(6);   // PING/PONG/BYE 之类的控制包，先计数
+            // ★ 回 PONG：电脑端「测连通」发的是 UDP PING。这里原来只把它记一笔就返回，
+            //   于是对手机测连通【必然】超时 —— 用户看到的永远是「没有回应 UDP 探测包」。
+            //   协议里 T_PONG 早就定义了，电脑↔电脑那条路也一直在互回（见 rtpaudio 的
+            //   _handle），只有手机缺这一段。
+            if (pkt.type == Proto.T_PING) {
+                // 控制包极少（按需回 PING 才来），单独拷一份负载即可，不进收包热路径的零分配约束。
+                byte[] cp = new byte[pkt.payloadLen];
+                System.arraycopy(buf, payloadStart, cp, 0, pkt.payloadLen);
+                replyPong(from, fromPort, cp);
+            }
+            // ★ 对端统计（T_STATS=7）：两台设备"自己交流"的唯一入口。对方每 2 秒说一次
+            //   "我发了多少、是不是正在发、我收了你多少"，界面据此直接显示是哪一端的问题。
+            //
+            //   必须放在下面 isAllowed(host) 白名单检查【之前】：统计是双向的 ——
+            //   我可能在给它送声音、但并没有勾「收听」它，这种时候同样要收得到它的回话。
+            //   （音频包仍然严格走白名单，这里只是控制包的分发。）
+            if (pkt.type == Proto.T_STATS) {
+                // 控制包（对端每 2 秒一次），单独拷一份，不影响音频热路径的零分配。
+                byte[] cp = new byte[pkt.payloadLen];
+                System.arraycopy(buf, payloadStart, cp, 0, pkt.payloadLen);
+                dispatchStats(host, cp);
+            }
+            return;
+        }
+        int plen0 = pkt.payloadLen;
+        // 记下"对面到底用什么编码发的"：这一条比任何猜测都直接（电脑端广播/路由用的是
+        // config.codec，默认 pcm_s16，但用户可能改成 opus 或 pcm_f32）。
+        if (pkt.codec != Proto.CODEC_PCM_S16) {
+            bumpBad(11, host, len);
+            lastCodecSeen = "codec=" + pkt.codec + "（" + codecName(pkt.codec) + "）";
+            sampleBad(4, buf, len, from, "编码 " + lastCodecSeen + "，负载 " + plen0
+                    + " 字节，samples=" + pkt.samples);
+            return;
+        }
+        lastCodecSeen = "codec=2（PCM 16位）";
+        if (!isAllowed(host)) {
+            bump(5);   // 用户没勾「收听」它（也没开「听广播」）
+            return;
+        }
+        int plen = plen0;
+        // ★★ 准入判据 = 【负载长度】，不再看 samples ★★
+        //
+        // 为什么（2026-10-14 跨端字段语义错误，用户报告里的真实数字）：
+        //   电脑端 audiomixing/net/rtpaudio.py 把 samples 填成了"累计帧偏移"
+        //   （4,924,800 = 480 × 10260），而 Python 接收端根本不读这个字段 ——
+        //   所以电脑↔电脑一直没症状；手机端以前严格校验它，于是那些包全部被拒，
+        //   表现就是"电脑在放声音、手机一个包都不收"。
+        //
+        // 新判据（只看负载；PCM16 立体声一包 1920 字节 = 480 帧 = 10ms）：
+        //   · plen == 1920 → 收下（标准包）
+        //   · plen <  1920 → 收下，尾巴补零（短读早就有这个能力，几毫秒静音听不出来）
+        //   · plen >  1920 → 拒绝（这才是真的"一包里塞了不止 480 帧"，我们不做重采样）
+        // samples 只作参考：和负载对不上就记一笔、在诊断报告里写人话，绝不因此拒收。
+        if (plen > FRAME_BYTES) {
+            bumpBad(12, host, len);
+            sampleBad(5, buf, len, from, "负载 " + plen + " 字节 > 一包 " + FRAME_BYTES
+                    + " 字节（samples=" + pkt.samples + "）");
+            return;
+        }
+        String smpNote = samplesNote(pkt.samples, plen);
+        if (smpNote.length() > 0) {
+            samplesMismatch++;
+            lastSamplesNote = smpNote;
+        }
+        // ★ 同一台设备只让一条流出声（见上面那一大段说明）
+        Integer busy = acceptStreamFor(host, pkt.ssrc);
+        if (busy != null) {
+            dupRoutePackets++;
+            if (fingerprintSeen(host, pkt.ssrc, buf, payloadStart, plen)) {
+                dupRouteConfirmed++;
+            }
+            dupRouteText = host + "：ssrc " + Integer.toHexString(busy) + " 正在放，"
+                    + "ssrc " + Integer.toHexString(pkt.ssrc) + " 已抑制（同一台设备的第 2 条流，不叠加）";
+            return;                      // 不建流、不混音 —— 只播一条
+        }
+        rememberFingerprint(host, pkt.ssrc, buf, payloadStart, plen);
+        // received 的口径 = 真正收下并会播出去的包；被抑制掉的重复流不算在里面
+        // （它们单独记在 dupRoutePackets，报告里分开写，免得"收包很多却没声音"这种假象）。
+        bump(0);
+        Stream stream = streamFor(host, pkt.ssrc);
+        stream.store(pkt.seq, buf, payloadStart, plen, (pkt.flags & Proto.FLAG_SILENCE) != 0);
+    }
+
+    /**
+     * 这台设备现在允许哪条流出声。
+     *
+     * @return null = 放行（这台还没有流，或者就是它自己在发）；否则返回<b>正在放</b>的那条流的 ssrc
+     *         （调用方据此抑制这一包）。
+     */
+    private Integer acceptStreamFor(String host, int ssrc) {
+        Integer cur = hostActiveSsrc.get(host);
+        if (cur == null) {
+            if (hostActiveSsrc.size() < 32) {      // 上限：防被人乱刷撑爆
+                hostActiveSsrc.put(host, ssrc);
+            }
+            return null;
+        }
+        if (cur == ssrc) {
+            return null;
+        }
+        // 已经有一条在放：它还在发吗？走了/断了就把位置让给新的这条。
+        Stream act = findStream(host, cur);
+        if (act == null || SystemClock.elapsedRealtime() - act.lastPacketMs > STREAM_IDLE_MS) {
+            hostActiveSsrc.put(host, ssrc);
+            return null;
+        }
+        return cur;
+    }
+
+    private Stream findStream(String host, int ssrc) {
+        for (Stream s : streams) {
+            if (s.ssrc == ssrc && host.equals(s.host)) {
+                return s;
+            }
+        }
+        return null;
+    }
+
+    /** 某台设备现在有没有在出声（界面用：显示"实际生效状态"）。 */
+    public boolean receivingFrom(String host) {
+        if (host == null || host.isEmpty()) {
+            return false;
+        }
+        long now = SystemClock.elapsedRealtime();
+        for (Stream s : streams) {
+            if (host.equals(s.host) && now - s.lastPacketMs <= 1000) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 一小段内容指纹；<b>0 = 静音/太短，不参与比对</b>。
+     *
+     * <p>为什么静音要排除：静音包的字节几乎一模一样，全都会被判成"同一份声音"，
+     * 那这个指标就永远是"确认"，一点信息量都没有。
+     */
+    private static int fingerprintOf(byte[] buf, int off, int len) {
+        if (buf == null || len < 16) {
+            return 0;
+        }
+        int h = 0;
+        int peak = 0;
+        // 每 24 个样本取一个：够区分内容，又几乎不吃 CPU（一包 40 次循环，100 包/秒）
+        for (int i = off; i + 1 < off + len; i += 48) {
+            int v = (short) ((buf[i] & 0xFF) | ((buf[i + 1] & 0xFF) << 8));
+            int a = v < 0 ? -v : v;
+            if (a > peak) {
+                peak = a;
+            }
+            h = h * 31 + v;
+        }
+        return peak < 64 ? 0 : h;
+    }
+
+    /** 这个包的内容，是不是"同一台设备另一条流最近发过的同一份声音"。 */
+    private boolean fingerprintSeen(String host, int ssrc, byte[] src, int srcOff, int len) {
+        int fp = fingerprintOf(src, srcOff, len);
+        if (fp == 0) {
+            return false;
+        }
+        long now = SystemClock.elapsedRealtime();
+        for (int i = 0; i < FP_HISTORY; i++) {
+            if (fpValue[i] == fp && fpSsrc[i] != ssrc && host.equals(fpHost[i])
+                    && now - fpAt[i] <= FP_WINDOW_MS) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void rememberFingerprint(String host, int ssrc, byte[] src, int srcOff, int len) {
+        int fp = fingerprintOf(src, srcOff, len);
+        if (fp == 0) {
+            return;
+        }
+        fpValue[fpIdx] = fp;
+        fpSsrc[fpIdx] = ssrc;
+        fpHost[fpIdx] = host;
+        fpAt[fpIdx] = SystemClock.elapsedRealtime();
+        fpIdx = (fpIdx + 1) % FP_HISTORY;
+    }
+
+    /**
+     * 描述"对面报的 samples 和负载长度对不上"这件事（人话）；对得上就返回空串。
+     *
+     * <p>为什么值得单独写一句话：电脑端历史版本把 samples 填成<b>累计帧偏移</b>
+     * （用户报告里 4,924,800 = 480 × 10260）。这在真机上看起来像"包全坏了"，
+     * 其实只是对方一个字段的语义不同 —— 报告里必须把这件事说清楚，
+     * 否则下一个人又会去查"是不是丢包/是不是编码不对"。
+     */
+    private static String samplesNote(int samples, int plen) {
+        int expect = plen / 4;                       // PCM16 立体声：4 字节一帧
+        if (samples == expect) {
+            return "";
+        }
+        if (plen == FRAME_BYTES && samples > Proto.FRAME_SAMPLES) {
+            return "对面把 samples 填成了累计值（" + samples + "），不影响播放 —— 已按负载长度接收（"
+                    + Proto.FRAME_SAMPLES + " 帧/" + FRAME_BYTES + " 字节）";
+        }
+        return "对面报的 samples=" + samples + " 和负载 " + plen
+                + " 字节对不上（按负载算应是 " + expect + " 帧），已按负载长度接收";
+    }
+
+    /** 编码的人话名字（和电脑端 proto.CODEC_NAMES 一致，报告里两边对得上）。 */
+    private static String codecName(int c) {
+        switch (c) {
+            case Proto.CODEC_PCM_F32:
+                return "PCM 浮点32，手机解不了";
+            case Proto.CODEC_PCM_S16:
+                return "PCM 16位";
+            case Proto.CODEC_OPUS:
+                return "Opus，手机解不了";
+            default:
+                return "未知编码";
+        }
+    }
+
+    /**
+     * 记一个坏包现场。{@code kind}：0=其它 1=太短 2=magic 3=版本 4=编码 5=帧长。
+     *
+     * <p>为什么要带"开头 16 个字节的十六进制"：3220 个坏包到底是"别人的流量"还是
+     * "我们自己的包但参数不对"，看一眼开头就能定性 —— 这是从一个数字变成一条线索的关键。
+     * （我们的包头开头一定是 {@code 4c 57 01}；是纯文本的话还能直接认出协议名，比如
+     * SSDP 的 "M-SEARCH"、DNS、mDNS 之类。）
+     * 另外带来源 IP 和总长度：如果都来自同一个地址，那基本就是某台设备在按我们不懂的方式发。
+     */
+    private void sampleBad(int kind, byte[] buf, int len, InetAddress from, String why) {
+        long now = SystemClock.elapsedRealtime();
+        int slot = (kind >= 0 && kind < lastSampleMs.length) ? kind : 0;
+        if (now - lastSampleMs[slot] < 500) {
+            return;                 // 节流：同一类坏包成灾时不必每个都拼字符串
+        }
+        lastSampleMs[slot] = now;
+        StringBuilder sb = new StringBuilder(128);
+        sb.append(why).append("；共 ").append(len).append(" 字节，来自 ")
+                .append(normalizeHost(from)).append("，开头 ");
+        int n = Math.min(16, len);
+        for (int i = 0; i < n; i++) {
+            int v = buf[i] & 0xFF;
+            if (v < 16) {
+                sb.append('0');
+            }
+            sb.append(Integer.toHexString(v)).append(' ');
+        }
+        String s = sb.toString();
+        switch (kind) {
+            case 1:
+                lastShortSample = s;
+                break;
+            case 2:
+                lastMagicSample = s;
+                break;
+            case 3:
+                lastVersionSample = s;
+                break;
+            case 4:
+                lastCodecSample = s;
+                break;
+            case 5:
+                lastFramesSample = s;
+                break;
+            default:
+                if (lastMagicSample.length() == 0) {
+                    lastMagicSample = s;
+                }
+        }
+    }
+
+    /**
+     * 回一个 PONG 给发 PING 的那台设备。
+     *
+     * <p>为什么必须有：电脑端「测连通」发的是 UDP PING，而安卓这边原来只把它记一笔
+     * （{@code bump(6)}）就返回 —— 于是对手机测连通【必然】超时，用户看到的永远是
+     * 「没有回应 UDP 探测包」。协议里 {@code T_PONG} 早就定义好了，电脑↔电脑那条路也一直
+     * 在互回（见 rtpaudio 的 _handle），只有手机缺这一段。回包里带上收到的 t0，
+     * 对端将来可以直接用它算时钟偏差。
+     *
+     * <p>回给 {@code fromPort} 而不是某个固定端口：电脑端是用一个临时 socket 发的 PING，
+     * 来源端口每次都不一样。
+     */
+    private void replyPong(InetAddress from, int fromPort, byte[] pingPayload) {
+        DatagramSocket s = socket;
+        if (s == null || from == null) {
+            return;
+        }
+        long now = System.currentTimeMillis() * 1_000_000L;
+        long t0 = jsonLong(pingPayload, "t0", 0L);
+        Proto.Pkt pong = new Proto.Pkt(Proto.T_PONG);
+        pong.ssrc = PONG_SSRC;
+        pong.tsNs = now;
+        pong.payload = ("{\"t0\":" + t0 + ",\"t1\":" + now + ",\"t2\":" + now + "}")
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] raw = Proto.encode(pong);
+        try {
+            s.send(new DatagramPacket(raw, raw.length, from, fromPort));
+        } catch (Throwable t) {
+            note("回 PONG 失败（" + from + ":" + fromPort + "）：" + t);
+        }
+    }
+
+    /** 从控制包的 JSON 负载里取一个整数字段。只认最简单的那种，不引 JSON 库。 */
+    private static long jsonLong(byte[] payload, String key, long fallback) {
+        if (payload == null || payload.length == 0) {
+            return fallback;
+        }
+        String s = new String(payload, java.nio.charset.StandardCharsets.UTF_8);
+        int i = s.indexOf("\"" + key + "\"");
+        int c = i < 0 ? -1 : s.indexOf(':', i);
+        if (c < 0) {
+            return fallback;
+        }
+        int j = c + 1;
+        while (j < s.length() && (s.charAt(j) == ' ' || s.charAt(j) == '\t')) {
+            j++;
+        }
+        int k = j;
+        while (k < s.length() && (s.charAt(k) == '-' || Character.isDigit(s.charAt(k)))) {
+            k++;
+        }
+        if (k == j) {
+            return fallback;
+        }
+        try {
+            return Long.parseLong(s.substring(j, k));
+        } catch (Throwable t) {
+            return fallback;
+        }
+    }
+
+    /**
+     * 把统计包交给监听器。
+     *
+     * <p><b>为什么整段都套 try/catch</b>：这段跑在收包线程上，而监听器是 {@link Engine} 的代码
+     * （里面要解析 JSON）。真机上 Wi-Fi 里什么怪包都有，解析失败一次就可能让"收听"整条链路停摆 ——
+     * 外层 rxLoop 虽然也有兜底，但那里 catch 之后会 sleep 50ms，抖动缓冲会被冲垮。
+     * 所以宁可在这里丢掉一份统计，也绝不让收包线程受一点影响。
+     */
+    private void dispatchStats(String host, byte[] payload) {
+        StatsListener l = statsListener;
+        if (l == null || payload == null || payload.length == 0) {
+            return;
+        }
+        try {
+            l.onStats(host, payload);
+        } catch (Throwable t) {
+            note("对端统计回调异常（已忽略）：" + t);
+        }
+    }
+
+    /** 只由收包线程调用：找不到就新建一条流。 */
+    private Stream streamFor(String host, int ssrc) {
+        String key = host + "/" + (ssrc & 0xFFFFFFFFL);
+        for (Stream s : streams) {
+            if (s.key.equals(key)) {
+                return s;
+            }
+        }
+        Stream s = new Stream(key, host, ssrc);
+        s.gain = gainFor(host);      // 用户给这台设过的增益，新流也要带上
+        s.channel = channelFor(host); // ★ 用户给这台设过的「左耳 / 右耳 / 双耳」，新流也要带上
+        s.extraDelayMs = outDelayMs; // ★ 本机输出延迟（远程/本地都可设），新流也要带上
+        streams.add(s);
+        ssrcSeen++;
+        Log.i(TAG, "新音频流：" + key);
+        return s;
+    }
+
+    // -------------------------------------------------------- 播放/混音线程
+
+    private void mixLoop() {
+        setAudioThreadPriority();
+        // 复用同一个混音缓冲：每 10ms 一趟的循环里绝不分配大对象，否则 GC 一停顿就是爆音。
+        byte[] mix = new byte[FRAME_BYTES];
+        int idleTicks = 0;
+        while (running) {
+            try {
+                Arrays.fill(mix, (byte) 0);
+                boolean produced = mixOnce(mix);
+                // ★ 2026-11-14：每 5 秒把缓冲深度落盘（诊断漂移/断流，事后导出看趋势）。
+                long nowS = SystemClock.elapsedRealtime();
+                // ★ 2026-11-14 看门狗：每 2 秒一条 [RX]，把"看不见的"变成数字。
+                //   判读口径：
+                //     · 「最大包间隔」> 100ms  → 网络/发送端断供（这是真正会听见卡的那种）；
+                //     · 「丢」持续增长但间隔正常 → 真的丢包（IP 分片/空口冲突）；
+                //     · 全都正常却还卡 → 音频内容本身在发送端就断了（seq 连续，收端看不出来）。
+                if (nowS - lastStatLogMs >= 2000) {
+                    lastStatLogMs = nowS;
+                    long rRec = 0, rLost = 0, rLate = 0, rDup = 0;
+                    int md = 0;
+                    for (Stream s : streams) {
+                        rRec += s.received;
+                        rLost += s.lost;
+                        rLate += s.late;
+                        rDup += s.dup;
+                        if (s.depthSnapshotMs > md) {
+                            md = s.depthSnapshotMs;
+                        }
+                    }
+                    int gap = maxArriveGapMs;
+                    maxArriveGapMs = 0;
+                    Log.i(TAG, "[RX] 流=" + streams.size() + " 收=" + rRec + " 丢=" + rLost
+                            + " 迟到=" + rLate + " 重复=" + rDup
+                            + " 深度=" + md + "ms 目标=" + targetMs
+                            + " 播放=" + trackPlaying + " 最大包间隔=" + gap + "ms");
+                }
+                if (nowS - lastSnapMs > 5000) {
+                    lastSnapMs = nowS;
+                    int md = 0;
+                    for (Stream s : streams) {
+                        if (s.depthSnapshotMs > md) {
+                            md = s.depthSnapshotMs;
+                        }
+                    }
+                    EventLog.log("SNAP", "depth=" + md + "ms target=" + targetMs
+                            + " streams=" + streams.size() + " playing=" + trackPlaying);
+                }
+                if (!produced) {
+                    // ★ 2026-11-14（治「零星卡」的核心）：只要还有流、且输出通道已在播，
+                    //   即使这一 tick 没有样本（某条流在预缓冲/等延迟/刚重置），也必须继续
+                    //   写一帧静音把 AudioFlinger 喂住。否则输出层被抽干 → BUFFER TIMEOUT
+                    //   → underrun（真机已抓到：流一重置就卡一下，而 App 侧 write 并不报错）。
+                    //   听感上这就是那一段本该有的静音，不会凭空多出一段。
+                    if (streams.isEmpty() || !trackPlaying) {
+                        // 真的没有流在播：不写 AudioTrack，省电也省 CPU。
+                        idleTicks++;
+                        if (idleTicks == 30 && trackPlaying) {
+                            pauseTrack();
+                        }
+                        sleepQuiet(10);
+                        continue;
+                    }
+                    // 有流且在播：落到下面照常 write（mix 已被清零 = 静音）
+                }
+                idleTicks = 0;
+                if (!ensurePlaying()) {
+                    sleepQuiet(10);
+                    continue;
+                }
+                AudioTrack t = track;
+                if (t == null) {
+                    sleepQuiet(10);
+                    continue;
+                }
+                // ★ 短写补齐：blocking write 正常一次写满，但欠载恢复/音频服务重启时
+                //   可能只写一部分；不补齐就会丢掉半帧样本，听感是"忽快 + 咔"。
+                int off = 0;
+                int lastW = 0;
+                while (off < FRAME_BYTES) {
+                    lastW = t.write(mix, off, FRAME_BYTES - off);
+                    if (lastW <= 0) {
+                        break;
+                    }
+                    off += lastW;
+                }
+                if (off < FRAME_BYTES) {
+                    trackErrors++;
+                    if (trackErrors % 20 == 1) {
+                        note("AudioTrack.write 失败：" + lastW + "（写入 "
+                                + off + "/" + FRAME_BYTES + "），尝试重建");
+                        EventLog.log("PLAY", "写失败 w=" + lastW + " off=" + off + "/" + FRAME_BYTES);
+                    }
+                    // 后台 30 秒回来、音频设备被别的应用抢走等情况都会走到这里：
+                    // 重建一次 AudioTrack 是最省事也最有效的自愈手段。
+                    pauseTrack();
+                    releaseTrack();
+                }
+            } catch (Throwable t) {
+                note("混音线程异常：" + t);
+                sleepQuiet(20);
+            }
+        }
+        releaseTrack();
+    }
+
+    /**
+     * 让每条流往前走一帧，并把结果相加到混音缓冲里。
+     * 具体每一步都在 {@link Stream#pump} 里（那里加了锁），这里只负责汇总。
+     *
+     * @return 是否有流在播放（没有的话调用方可以干脆不写 AudioTrack）
+     */
+    private boolean mixOnce(byte[] mix) {
+        long now = SystemClock.elapsedRealtime();
+        float outPeak = 0f;
+        boolean produced = false;
+        int dropAbove = targetMs + DROP_ABOVE_EXTRA_MS;
+
+        for (Stream s : streams) {
+            // 对端走了/断了：摘掉，别留着一个永远不出声的流占混音位置。
+            if (now - s.lastPacketMs > STREAM_IDLE_MS) {
+                streams.remove(s);
+                Log.i(TAG, "音频流超时移除：" + s.key);
+                continue;
+            }
+            if (s.pump(mix, now, targetMs, dropAbove) != 0) {
+                produced = true;
+            }
+            if (s.peak > outPeak) {
+                outPeak = s.peak;
+            }
+        }
+        // ★ 合并版：全局左右声道矩阵在这里套用（所有流混完、写 AudioTrack 之前）。
+        //   放在 mixOnce 而不是 mixLoop，是为了让电平条读到的是【最终真正播出去的样本】——
+        //   「仅左」时右耳已经没声音了，界面却还显示满格就说不过去了（项目铁律：数字要如实）。
+        //   全默认时 apply 直接返回、也不重算峰值，热路径零额外开销；
+        //   「按设备分配到某只耳朵」在 Stream.store 里逐路完成（见 scaleAndRoutePcm16），
+        //   那一级的电平由 Stream.peak 自己算，本来就准。
+        channelRouter.apply(mix, FRAME_BYTES);
+        if (!channelRouter.isDefault()) {
+            float finalPeak = 0f;
+            for (int i = 0; i + 1 < FRAME_BYTES; i += 2) {
+                int v = (short) ((mix[i] & 0xFF) | ((mix[i + 1] & 0xFF) << 8));
+                int a = v < 0 ? -v : v;
+                if (a > finalPeak) {
+                    finalPeak = a;
+                }
+            }
+            outPeak = finalPeak / 32768f;
+        }
+        peak = outPeak;
+        return produced;
+    }
+
+    private boolean ensurePlaying() {
+        AudioTrack t = track;
+        if (t == null) {
+            t = openTrack();
+            if (t == null) {
+                return false;
+            }
+            track = t;
+        }
+        if (!trackPlaying) {
+            try {
+                t.setVolume(gain);
+                // ★★ 核心修复：先把输出层水位垫到 100ms，再 play。
+                //    不预填的话 AudioTrack 里只有 play 后写的那一帧（10ms 水位），
+                //    Java 线程一次调度停顿就会 underrun（真机日志 251 次已坐实）。
+                //    写的是静音帧，全是连续内容，播放仍按音频时钟匀速，不会"变快"。
+                byte[] silence = new byte[FRAME_BYTES];
+                int filled = 0;
+                for (int i = 0; i < TRACK_PREFILL_FRAMES; i++) {
+                    int w = t.write(silence, 0, FRAME_BYTES);
+                    if (w != FRAME_BYTES) {
+                        break;      // 写不动就到此为止，绝不把起播卡死
+                    }
+                    filled++;
+                }
+                t.play();
+                trackPlaying = true;
+                Log.i(TAG, "起播：已预填 " + (filled * 10) + "ms 输出水位");
+            } catch (Throwable e) {
+                note("AudioTrack.play 失败：" + e);
+                releaseTrack();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void pauseTrack() {
+        AudioTrack t = track;
+        if (t != null) {
+            try {
+                t.pause();
+                t.flush();   // 把停下来这段时间的旧数据丢掉，恢复时才不会放出一段"过去的声音"
+            } catch (Throwable ignored) {
+            }
+        }
+        trackPlaying = false;
+    }
+
+    private AudioTrack openTrack() {
+        try {
+            int minBuf = AudioTrack.getMinBufferSize(Proto.SAMPLE_RATE,
+                    AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT);
+            if (minBuf <= 0) {
+                minBuf = FRAME_BYTES * 4;
+            }
+            // ★ 2026-11-13：容量固定 16 帧（160ms），取 max 只为兼容厂商异常大的 minBuf。
+            //   旧写法 max(minBuf, 2帧) 的真机值 24576 字节看似够，但「容量 ≠ 水位」：
+            //   play() 时是空的，实际只有一帧 —— 这就是刷屏 underrun 的原因（见常量区注释）。
+            int bufBytes = Math.max(minBuf, FRAME_BYTES * TRACK_BUFFER_FRAMES);
+            // ★ 2026-11-12：改走 AudioCompat —— API 23 以下没有 Builder，得用老构造器，
+            //   否则 Android 5.1 的机器（比如电视盒子）连播放都建不起来。
+            //   能走快速混音通道就走；厂商不给也无所谓，只是延迟略大。
+            // ★ 不请求低延迟 FAST 通道：它缓冲小、调度一抖就欠载，与"不卡"直接冲突。
+            AudioTrack t = AudioCompat.newTrack(Proto.SAMPLE_RATE,
+                    AudioFormat.CHANNEL_OUT_STEREO, bufBytes, false);
+            if (t == null) {
+                note("这台机器建不出播放设备（AudioTrack 构造失败）");
+                return null;
+            }
+            if (t.getState() != AudioTrack.STATE_INITIALIZED) {
+                note("AudioTrack 初始化失败（没有可用输出设备？）");
+                try {
+                    t.release();
+                } catch (Throwable ignored) {
+                }
+                return null;
+            }
+            Log.i(TAG, "AudioTrack 就绪：缓冲 " + bufBytes + " 字节（"
+                    + (bufBytes / FRAME_BYTES * 10) + "ms 容量），起播预填 "
+                    + (TRACK_PREFILL_FRAMES * 10) + "ms 水位");
+            return t;
+        } catch (Throwable e) {
+            note("AudioTrack 创建失败：" + e);
+            return null;
+        }
+    }
+
+    private void releaseTrack() {
+        AudioTrack t = track;
+        track = null;
+        trackPlaying = false;
+        if (t != null) {
+            try {
+                t.pause();
+            } catch (Throwable ignored) {
+            }
+            try {
+                t.flush();
+            } catch (Throwable ignored) {
+            }
+            try {
+                t.release();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ 内部
+
+    /**
+     * 一条发送方的抖动缓冲。
+     *
+     * <p>结构是一个 32 槽的环形数组，槽位下标就是 {@code seq & 31}：
+     * {@code nextSeq} 是"下一个要播的序号"，收到的包按它到 {@code nextSeq} 的距离落槽；
+     * 落在过去（已播过）的直接丢并计入迟到，超前的放进槽里等播放线程来取。
+     * 这样写比维护一个有序 map 快得多，而且播放路径上完全不分配内存。
+     *
+     * <p><b>锁</b>：收包线程和播放线程都要碰 {@code nextSeq/filled}，所以这几个字段统一用
+     * {@code synchronized(this)} 保护（每 10 毫秒抢一次、临界区只有几百纳秒，代价可以忽略）。
+     * 统计字段用 volatile：界面线程会无锁读它们画电平条。
+     */
+    private final class Stream {
+        final String key;
+        final String host;
+        final int ssrc;
+        final byte[][] slots = new byte[SLOTS][FRAME_BYTES];
+        final boolean[] filled = new boolean[SLOTS];
+
+        int nextSeq = -1;
+        int highestSeq = 0;
+        boolean playing;
+        long prebufStartMs;
+        volatile long lastPacketMs = SystemClock.elapsedRealtime();
+        /** 上次"流断重预缓冲"日志的时间（诊断用，节流到 2 秒一条）。 */
+        private long lastResetLogMs = 0;
+        /** 上次"压延迟丢帧"日志的时间（诊断用，节流到 0.8 秒一条）。 */
+        private long lastDropLogMs = 0;
+        volatile long received;
+        /** ★ 2026-11-17 晚：这条流累计收到的字节（监控页"接收多少 M"用它，比按包数估算准）。 */
+        volatile long bytesReceived;
+        volatile long lost;
+        volatile long late;
+        volatile long dup;
+        volatile float peak;
+        /** ★ 这一路自己的增益（"我听它的"滑杆，1.0 = 原样）。由界面线程改、收包线程读。 */
+        volatile float gain = 1f;
+        /**
+         * ★ 合并版：这一路进哪只耳朵 —— 0 双耳 / 1 只左 / 2 只右。
+         * 写字面量而不是 ChannelRouter.CH_*，是为了让 tools/extract_stream.awk 抽出来的
+         * Stream 类仍能独立编译（离线抖动测试不引用任何外部类）。
+         */
+        volatile int channel = 0;
+        /**
+         * ★ 2026-11-12：这一路额外延迟多少毫秒（逐设备延迟补偿）。
+         *
+         * <p>用途：多台设备放同一个声音时，Wi-Fi 快的那台先出声、慢的后出声，听起来是
+         * 两重唱。给快的那台加几十毫秒延迟就能对齐 —— 补偿的是**网络快慢**，
+         * 不是替代抖动缓冲（抖动缓冲吸收的是忽快忽慢，这个是整体往后挪）。
+         *
+         * <p>实现上不改收包、只改"什么时候开始播 + 允许多深的积压"：目标深度从
+         * {@code targetMs} 变成 {@code targetMs + extraDelayMs}，播放头就永远落后
+         * 对端这么多，声音自然晚出来这么久，而且一直稳定住。
+         */
+        volatile int extraDelayMs = 0;
+
+        /**
+         * 已经在播放头里生效的额外延迟（毫秒）。
+         *
+         * <p>★ 2026-11-13 用户：「拖动延迟时其他设备没有更新，只有音量更新了」——
+         * 根因就在这里：{@link #extraDelayMs} 之前**只用在起播前的预缓冲判断**上，
+         * 流一旦 playing=true，再改这个值就再也不进那段逻辑，于是拖滑杆完全没反应
+         * （音量能生效是因为增益是每帧现读的）。
+         *
+         * <p>现在拿它和 {@link #extraDelayMs} 的差做"实时挪播放头"：
+         * 差为正 → 这条流原地等这么多毫秒（等于插静音，声音整体往后挪）；
+         * 差为负 → 直接从缓冲里丢掉这一段（声音整体往前挪）。
+         */
+        private int appliedExtraMs = 0;
+
+        /**
+         * 上次真正生效的抖动目标（毫秒）。★ 2026-11-14 实测发现的关键缺陷就靠它修：
+         *
+         * <p>原来切档只改 {@code targetMs}（进而改 dropAbove 阈值），但预缓冲那段逻辑
+         * <b>只在 {@code !playing} 时跑一次</b>；流已经在播时播放头不会动，而"包到达速率 ≈
+         * 播放消耗速率"（净增几乎为 0），于是深度一直卡在起播时的量 —— 实测 1500/2000/
+         * 2500/3000 四档深度全是 ~1870ms，四档完全等效，用户切到 3000 享受的还是 1870。
+         *
+         * <p>修法：档位<b>调大</b>时给 {@code holdMs} 加一段（播放头原地等），缓冲就会真的
+         * 涨到新目标。代价是切档瞬间静音「增量」毫秒（1500→2000 静音 0.5 秒），这是把缓冲
+         * 垫深的物理代价，界面会提前 toast 提示。调小不用管：dropAbove 变小后会自然削回去。
+         */
+        private int appliedTargetMs = -1;
+
+        /** 正在"原地等"的毫秒数（增加延迟时用，每 tick 减 10）。 */
+        private int holdMs = 0;
+
+        /**
+         * ★ 2026-11-13（2.40 之后越来越卡的元凶之一）：缓冲深度快照。
+         *   depthMs() 是 synchronized，和播放线程 pump() 抢【同一把锁】；而监控面板
+         *   每轮刷新都经 hostBufferMs()/stats() 去调它。盒子 CPU 一弱，10ms 一趟的
+         *   播放循环就被 UI 顶掉 → AudioTrack 欠载（真机日志刷屏 underrun）。
+         *   2.40 的监控面板没有这些逐台读数，所以不卡。
+         *   改为：pump 持锁期间算一次存这里，UI 只读 volatile 整数，零锁竞争。
+         */
+        volatile int depthSnapshotMs = 0;
+
+        Stream(String key, String host, int ssrc) {
+            this.key = key;
+            this.host = host;
+            this.ssrc = ssrc;
+        }
+
+        /** 收包线程调用：把这一包放进对应槽位（负载直接从收包缓冲 src 拷，不另分配）。 */
+        void store(int seq, byte[] src, int srcOff, int len, boolean silent) {
+            long now = SystemClock.elapsedRealtime();
+            lastPacketMs = now;
+            received++;
+            if (len > 0) {
+                bytesReceived += len;   // ★ 2026-11-17 晚：累计收到字节（监控页"接收多少 M"）
+            }
+            synchronized (this) {
+                if (nextSeq < 0) {
+                    // 这条流的第一包：它就是播放的起点，预缓冲计时也从这一刻开始。
+                    nextSeq = seq;
+                    highestSeq = seq;
+                    prebufStartMs = now;
+                } else {
+                    int d = (seq - nextSeq) & 0xFFFF;
+                    if (d >= 0x8000) {
+                        late++;       // 已经播过这个序号了（迟到/重复的老包），不能倒回去播
+                        return;
+                    }
+                    if (d >= SLOTS) {
+                        late++;       // 太超前，缓冲装不下：说明我们这边卡了很久，丢比塞进去更安全
+                        return;
+                    }
+                    if (((seq - nextSeq) & 0xFFFF) > ((highestSeq - nextSeq) & 0xFFFF)) {
+                        // ★ NACK：新包比之前见过的最大序号还大，中间若有断层就是丢了包。
+                        //   （重复副本是旧 seq，走上面的 late/dup 分支，不会到这里误报。）
+                        if (nackEnabled && nackListener != null) {
+                            int ahead = (seq - highestSeq) & 0xFFFF;
+                            if (ahead > 1 && ahead < 0x8000 && ahead <= NACK_MAX_GAP) {
+                                for (int m = 1; m < ahead; m++) {
+                                    noteNackGap((highestSeq + m) & 0xFFFF);
+                                }
+                                flushNack(host);
+                            }
+                        }
+                        highestSeq = seq;
+                    }
+                }
+                int idx = seq & MASK;
+                if (filled[idx]) {
+                    dup++;
+                    return;
+                }
+                byte[] slot = slots[idx];
+                if (silent || len <= 0) {
+                    // 对端明确标了"静音"：占住槽位但不拷数据，播放时就不会把它算成丢包。
+                    Arrays.fill(slot, (byte) 0);
+                } else if (gain == 1f && channel == 0) {
+                    // 绝大多数情况走这条：双耳 + 原增益，原样拷贝，一次乘法都不做。
+                    System.arraycopy(src, srcOff, slot, 0, len);
+                    if (len < FRAME_BYTES) {
+                        Arrays.fill(slot, len, FRAME_BYTES, (byte) 0);   // 短包尾巴补零
+                    }
+                } else {
+                    // ★ 这一台自己设了增益，或者被指定只进左/右耳：
+                    //   逐帧乘增益 + 按声道归位，别的流不受影响。
+                    scaleAndRoutePcm16(src, srcOff, slot, len, gain, channel);
+                    if (len < FRAME_BYTES) {
+                        Arrays.fill(slot, len, FRAME_BYTES, (byte) 0);
+                    }
+                }
+                filled[idx] = true;
+            }
+        }
+
+        /**
+         * 把 PCM16 样本乘上增益后拷进目标缓冲（带削顶），并按 {@code ch} 归位到左/右耳。
+         *
+         * <p><b>★ 合并版的关键一步</b>：协议里每一路本来就是 48 kHz 交错立体声，
+         * 但多路会混进同一个 {@code mix}。想让「电脑 A 只进左耳、电脑 B 只进右耳」，
+         * 最干净的时点就是这里 —— 在每一路独自成型、还没混在一起之前，
+         * 把 L+R 折成单声道后只写一侧，另一侧清零。之后 {@code pump()} 的混音、
+         * 削顶、丢包统计全都不用改，风险最低。
+         *
+         * <p><b>为什么方法留在 Stream 内部</b>：{@code tools/extract_stream.awk} 会把
+         * Stream 类单独抽出来编译跑抖动测试，引用外部类会让它编译不过；
+         * 所以这个方法自包含，算法与 {@link ChannelRouter#routeAndScale} 逐字一致。
+         *
+         * <p>超过 32767 必须削顶 —— 回绕会变成刺耳的爆音。
+         */
+        private void scaleAndRoutePcm16(byte[] src, int srcOff, byte[] dst, int len, float g, int ch) {
+            int i = 0;
+            final int end = Math.min(len, dst.length) - 3;
+            for (; i < end; i += 4) {
+                int l = (short) ((src[srcOff + i] & 0xFF) | ((src[srcOff + i + 1] & 0xFF) << 8));
+                int r = (short) ((src[srcOff + i + 2] & 0xFF) | ((src[srcOff + i + 3] & 0xFF) << 8));
+                if (ch == 1) {          // 只进左耳：整路内容折单声道后放左边
+                    l = (l + r) / 2;
+                    r = 0;
+                } else if (ch == 2) {   // 只进右耳
+                    r = (l + r) / 2;
+                    l = 0;
+                }
+                int ol = clip16(Math.round(l * g));
+                int or = clip16(Math.round(r * g));
+                dst[i] = (byte) ol;
+                dst[i + 1] = (byte) (ol >> 8);
+                dst[i + 2] = (byte) or;
+                dst[i + 3] = (byte) (or >> 8);
+            }
+            // 不足一帧的尾巴（正常协议里不会出现，帧长恒为 4 的倍数）：按单样本兜底。
+            for (; i + 1 < len; i += 2) {
+                int v = (short) ((src[srcOff + i] & 0xFF) | ((src[srcOff + i + 1] & 0xFF) << 8));
+                int out = clip16(Math.round(v * g));
+                dst[i] = (byte) out;
+                dst[i + 1] = (byte) (out >> 8);
+            }
+        }
+
+        private static int clip16(int v) {
+            if (v > 32767) return 32767;
+            if (v < -32768) return -32768;
+            return v;
+        }
+
+        /**
+         * 播放线程调用：让这条流往前走一帧（必要时先预缓冲、或主动丢一帧压延迟），
+         * 有数据就相加进 {@code mix}。
+         *
+         * @return 0 = 这一 tick 这条流不出声（还在预缓冲）；1 = 在播（可能是补的静音）
+         */
+        synchronized int pump(byte[] mix, long now, int targetMs, int dropAboveMs) {
+            if (nextSeq < 0) {
+                depthSnapshotMs = 0;
+                return 0;   // 还没收到第一包
+            }
+            // ★ 每 tick 在持锁期间刷新一次快照，供界面读取（UI 不再调用 synchronized depthMs）
+            depthSnapshotMs = depthMs();
+            // ★ 逐设备延迟补偿：这条流要压住的深度 = 抖动目标 + 用户给这一台加的延迟。
+            //   下面两处判断都用 wantMs —— 一处决定"攒到多少才开始播"，一处决定
+            //   "积到多少算太多、要丢一帧压回去"。两处必须同时加上，否则新加的延迟
+            //   会在几秒内被"压延迟"那条规则吃掉，用户看到的是"设了没用"。
+            int wantMs = targetMs + extraDelayMs;
+
+            // ★ 2026-11-14：档位调大时把缓冲真正垫深（见 appliedTargetMs 的说明）。
+            //   放在 holdMs 处理之前，这样本 tick 就开始"原地等"。
+            if (appliedTargetMs < 0) {
+                appliedTargetMs = targetMs;      // 首次：只记下来，不垫（起播时预缓冲已经按它走）
+            } else if (targetMs > appliedTargetMs) {
+                if (playing) {
+                    holdMs += (targetMs - appliedTargetMs);
+                    Log.i(TAG, "档位调大 " + appliedTargetMs + "→" + targetMs
+                            + "ms：原地等 " + (targetMs - appliedTargetMs) + "ms 把缓冲垫深");
+                }
+                appliedTargetMs = targetMs;
+            } else if (targetMs < appliedTargetMs) {
+                // 调小：dropAbove 会变小，超出的部分由下面的"压延迟丢帧"自然削回，不用额外处理。
+                appliedTargetMs = targetMs;
+            }
+
+            // ★ 播放中实时改延迟：把播放头挪到新位置，而不是"下次起播才生效"。
+            int deltaMs = extraDelayMs - appliedExtraMs;
+            if (deltaMs != 0) {
+                if (!playing) {
+                    appliedExtraMs = extraDelayMs;      // 还没出声：预缓冲直接用新目标
+                } else if (deltaMs > 0) {
+                    // 要更晚出来：这条流原地等，其余流照播（混音是相加，"等"就是不混）。
+                    holdMs += deltaMs;
+                    appliedExtraMs = extraDelayMs;
+                } else {
+                    // 要更早出来：把缓冲里这段直接丢掉，等于把播放头往前挪。
+                    // 两道限制：
+                    //  ① 只能丢掉"手里真有的"——丢到还没到达的序号上，那些包稍后会被判成迟到，
+                    //     白白多丢一段音频（真机上表现为"拖一下延迟，声音断一下"）；
+                    //  ② 最多只减到抖动目标（targetMs）为止。把缓冲丢空会让 pump 认为"流断了"，
+                    //     于是整条流重置回等第一包 —— 听起来是"拖一下延迟，声音彻底没了"。
+                    int need = Math.min(-deltaMs, Math.max(0, depthMs() - targetMs));
+                    int guard = 0;
+                    while (need > 0 && guard++ < SLOTS) {
+                        int dropIdx = nextSeq & MASK;
+                        if (filled[dropIdx]) {
+                            filled[dropIdx] = false;
+                        }
+                        nextSeq = (nextSeq + 1) & 0xFFFF;
+                        need -= 10;
+                        peak *= PEAK_DECAY;
+                    }
+                    appliedExtraMs = extraDelayMs;
+                }
+            }
+            if (holdMs > 0) {
+                holdMs -= 10;
+                return 0;   // 这一 tick 不出声 = 给这条流插了 10ms 静音
+            }
+
+            if (!playing) {
+                int bufferedMs = depthMs();
+                // 预缓冲上限**不能**跟着槽位数走：32 槽时它是 (32-4)*10 = 280ms，
+                // 槽位翻到 64 之后若还用这个式子就变成 600ms —— 开局遇到突发会先攒
+                // 半秒才出声，听起来就是"点了收听半天没动静"。
+                // 上限只跟"想压多深"有关：目标 + 160ms 的余量。默认正好还是 280ms，
+                // 和改动前逐字一致；只有用户自己加了延迟才会往上抬。
+                int prebufCapMs = wantMs + PREBUF_EXTRA_MS;
+                if (now - prebufStartMs < wantMs && bufferedMs < prebufCapMs) {
+                    return 0;   // 先攒够再播：这一段不出声，换来后面不卡
+                }
+                playing = true;
+            }
+            // 缓冲积太多说明我们播得比对方发得慢（两端音频时钟有 ppm 级漂移），
+            // 或者刚开始播时手里已经攒了一大段。要主动丢掉多余的，把延迟压回去。
+            //
+            // ★ 2026-10-12 真机反馈的头号问题（"连上了、数字都在动、就是没声音"）：
+            //   这里原来是"每 tick 只丢一帧，然后 return"。对端每 10ms 也正好来一帧，
+            //   于是变成收一帧丢一帧，缓冲深度永远降不下来 —— 结果每个 tick 都在丢，
+            //   实测 5946 个包里 5908 个被这样丢掉，等于全程静音。
+            //   修法：一次把多出来的全丢到目标深度，然后【继续往下正常播放】，不要 return。
+            // 注意 hold 期间缓冲会自然上涨，阈值要把 holdMs 加回去 —— 否则刚插进去的
+            // 静音会在同一个 tick 被"积压太多→丢帧"抵消掉，用户看到的就是"拖了没用"。
+            if (depthMs() > dropAboveMs + extraDelayMs + holdMs) {
+                int beforeDepth = depthMs();
+                int guard = 0;
+                // ★ 2026-11-14（不卡优先）：只削到"阈值"为止，不再一口气砍到 wantMs。
+                //   旧写法一次丢到 wantMs，等于每校正一次就跳掉 80ms（听感是"卡一下"）；
+                //   现在只丢刚超出阈值的那 1~2 帧（听感是极短的"嗒"），缓冲稳定维持在
+                //   target+80ms，抗抖余量更深，又不会周期性砍掉一大段。
+                while (depthMs() > dropAboveMs + extraDelayMs + holdMs && guard++ < SLOTS) {
+                    filled[nextSeq & MASK] = false;
+                    nextSeq = (nextSeq + 1) & 0xFFFF;
+                    lost++;
+                    peak *= PEAK_DECAY;
+                }
+                // ★ 2026-11-14 诊断：记一次"压延迟丢帧"。若它每 ~5 秒出现一次，就是两端
+                //   音频时钟漂移（发送快于播放）把缓冲顶到阈值 → 每次跳一小段 = "卡一下"。
+                if (now - lastDropLogMs > 800) {
+                    lastDropLogMs = now;
+                    Log.i(TAG, "压延迟丢帧：缓冲 " + beforeDepth + "ms → " + depthMs()
+                            + "ms（疑似两端时钟漂移）");
+                    EventLog.log("RX", "丢帧 " + beforeDepth + "→" + depthMs() + "ms target=" + wantMs);
+                }
+                // 注意：这里不 return，让这一 tick 照常出声，否则永远播不出第一帧。
+            }
+            int idx = nextSeq & MASK;
+            if (filled[idx]) {
+                byte[] src = slots[idx];
+                filled[idx] = false;
+                float p = 0f;
+                for (int i = 0; i < FRAME_BYTES; i += 2) {
+                    int a = (mix[i] & 0xFF) | (mix[i + 1] << 8);
+                    int b = (src[i] & 0xFF) | (src[i + 1] << 8);
+                    int m = a + b;
+                    if (m > 32767) {
+                        m = 32767;          // 多台设备同时出声必须削顶，回绕会变成刺耳的噪声
+                    } else if (m < -32768) {
+                        m = -32768;
+                    }
+                    mix[i] = (byte) m;
+                    mix[i + 1] = (byte) (m >> 8);
+                    int abs = b < 0 ? -b : b;
+                    if (abs > p) {
+                        p = abs;
+                    }
+                }
+                float pf = p / 32768f;
+                // 快起慢落：数字每秒跳 100 次，不衰减的话界面根本看不清。
+                peak = pf >= peak ? pf : peak * PEAK_DECAY;
+            } else {
+                // 这一包没到：补静音（什么都不混就是静音）。不补的话整条流会往后错位。
+                lost++;
+                int ahead = (highestSeq - nextSeq) & 0xFFFF;
+                if (ahead == 0 || ahead >= 0x8000) {
+                    // 手上没有任何更新的包 —— 这不是丢包，是流断了（对端切后台 / Wi-Fi 打个嗝）。
+                    // 回到预缓冲状态，等它恢复时重新攒一段再播；继续傻等会让序号错位到最后全变"迟到"。
+                    playing = false;
+                    nextSeq = -1;
+                    prebufStartMs = now;
+                    Arrays.fill(filled, false);
+                    bump(7);   // recoveries
+                    // ★ 2026-11-14 诊断：记一次"流被抽空→重预缓冲"（最多 2 秒一条）。
+                    //   零星卡若与它同时出现，就说明是输入侧 >缓冲 的断流（网络/发送端），
+                    //   不是输出层；若两者不同时出现，才算输出层问题。
+                    if (now - lastResetLogMs > 2000) {
+                        lastResetLogMs = now;
+                        Log.i(TAG, "流断重预缓冲：" + key + "（缓冲被抽空，卡一下就在这里）");
+                        EventLog.log("RX", "重置 key=" + key + " target=" + wantMs);
+                    }
+                    // ★ 这里必须直接返回。原来会一路走到函数末尾那句无条件的
+                    //   nextSeq = (nextSeq + 1) & 0xFFFF，把刚设好的 -1 推成 0：
+                    //   播放头于是在一个空缓冲上空转计数，等对端恢复时新包全被判成"太超前"丢掉，
+                    //   流再也回不来（离线抖动缓冲测试抓到："断流 2.5s 后恢复：重新出声 0 帧"）。
+                    return 0;
+                }
+            }
+            // 双保险：恢复分支把 nextSeq 置成 -1 之后，绝不能再自增（-1 是"等第一包"的哨兵值）。
+            if (nextSeq < 0) {
+                return 0;
+            }
+            nextSeq = (nextSeq + 1) & 0xFFFF;
+            return 1;
+        }
+
+        /** 缓冲里还有多少帧可用，折算成毫秒（槽位只有 32 个，数一遍比维护计数器更难写错）。 */
+        synchronized int depthMs() {
+            if (nextSeq < 0) {
+                return 0;
+            }
+            int n = 0;
+            for (int i = 0; i < SLOTS; i++) {
+                if (filled[(nextSeq + i) & MASK]) {
+                    n++;
+                }
+            }
+            return n * 10;
+        }
+    }
+
+    /**
+     * ★ 每台设备各自的"我听它的"增益（界面滑杆）。
+     *
+     * <p>为什么不直接改总增益：用户要的是<b>每一台自己一条可调音量条</b>
+     * （原话：「我要求的是各设备可调节的音量条」）。做法是把增益乘在<b>这一路</b>的样本上
+     * （{@link Stream#store} 拷进槽位时乘），所以各台互不影响；总增益（AudioTrack 音量）照旧叠在上面。
+     *
+     * <p>写的是 copy-on-write 的不可变 map：收包线程每包要读一次，不能让它去抢锁。
+     */
+    private volatile Map<String, Float> hostGain = Collections.emptyMap();
+
+    /** 设定某一台的接收增益（0~1.5，1.0 = 原样）。立刻生效。 */
+    public void setHostGain(String host, float g) {
+        if (host == null || host.isEmpty()) {
+            return;
+        }
+        float v = Math.max(0f, Math.min(2f, g));
+        Map<String, Float> next = new HashMap<>(hostGain);
+        next.put(host, v);
+        hostGain = Collections.unmodifiableMap(next);   // 一次替换，收包线程永远读到完整的一份
+        for (Stream s : streams) {
+            if (host.equals(s.host)) {
+                s.gain = v;
+            }
+        }
+    }
+
+    /** 某一台现在的接收增益。 */
+    public float hostGain(String host) {
+        Float v = hostGain.get(host);
+        return v == null ? 1f : v;
+    }
+
+    /** 新建流时把用户设过的增益带上（不然新流的滑杆会"跳回 1.00"）。 */
+    private float gainFor(String host) {
+        Float v = hostGain.get(host);
+        return v == null ? 1f : v;
+    }
+
+    // ══════════════════ ★ 本机输出延迟（"谁先出声"对齐） ══════════════════
+    //
+    // 和抖动缓冲的分工，别混：
+    //   · 抖动缓冲（targetMs，100~200）：吸收"忽快忽慢"，解决**卡顿**；
+    //   · 这里的延迟（0~300）：整条混音一起往后挪，解决**两台设备不同步**。
+    // 场景：两台手机放同一个声音，Wi-Fi 好的那台先出声、差的那台慢半拍，
+    // 听起来是两重唱。给快的那台加几十毫秒就对齐了。
+    //
+    // ★ 2026-11-13 用户：「拖动其他设备的延迟滑块，其他设备上没有实时滑块 UI 更新，
+    //   只有音量滑块可以」—— 原来的"逐台延迟补偿"是纯本机的（对端根本不知道），
+    //   所以对端界面永远不动。现在改成和「它的音量」完全对称的机制：
+    //   对端发 out_ctl delay → 落到这个"本机输出延迟"上，自己的「本机延迟」滑杆
+    //   立刻跟着动，统计里再报出去，让拖动那台的「它的延迟」滑杆也对齐真相。
+    private volatile int outDelayMs = 0;
+
+    /** 设定本机输出延迟（0~300ms）：整条混音往后挪，正在播的流也不打断。 */
+    public void setOutDelay(int ms) {
+        int v = Math.max(0, Math.min(MAX_EXTRA_DELAY_MS, ms));
+        if (v == outDelayMs) {
+            return;
+        }
+        outDelayMs = v;
+        for (Stream s : streams) {
+            s.extraDelayMs = v;   // pump 里已有"实时挪播放头"，加/减都能平滑过渡
+        }
+    }
+
+    /** 本机现在的输出延迟（毫秒）。 */
+    public int outDelay() { return outDelayMs; }
+
+    /**
+     * 这台设备现在的缓冲积压（毫秒）—— 界面上的"延迟测试"读数。
+     *
+     * <p>怎么用它：<b>积压 ≈ 抖动目标 + 你加的延迟</b>。如果某台一直往上飘
+     * （比如 200 → 260 → 320），说明它的 Wi-Fi 在持续掉队，加延迟只会更糟，
+     * 该做的是把它挪近路由器；如果稳定在目标值附近，加延迟就是安全的。
+     */
+    public int hostBufferMs(String host) {
+        int best = 0;
+        for (Stream s : streams) {
+            if (host == null || host.equals(s.host)) {
+                int d = s.depthSnapshotMs;   // ★ 读快照，不抢播放线程的锁
+                if (d > best) {
+                    best = d;
+                }
+            }
+        }
+        return best;
+    }
+
+    /** 这台设备累计迟到 / 丢包（诊断与"延迟测试"用）。返回 {late, lost}。 */
+    public long[] hostPacketStats(String host) {
+        long late = 0;
+        long lost = 0;
+        for (Stream s : streams) {
+            if (host == null || host.equals(s.host)) {
+                late += s.late;
+                lost += s.lost;
+            }
+        }
+        return new long[]{late, lost};
+    }
+
+    // ══════════════ ★ 合并版：左右声道（手机端本级控制） ══════════════
+    //
+    // 层级说明（别和"按设备分配"混了）：
+    //   · 全局矩阵 = 本机喇叭/耳机最终怎么出声 —— 模式、平衡、左右独立音量；
+    //   · 按设备分配 = 某一路来源先折成单声道，只写进左槽或右槽（Stream.store）。
+    // 前者在 mixLoop 里套，后者在收包线程里套，两级互不干扰，也不改协议、不改包头。
+
+    /** 全局声道模式：{@link ChannelRouter#MODE_STEREO} 等。 */
+    public void setChannelMode(int m) { channelRouter.setMode(m); }
+    public int channelMode() { return channelRouter.mode(); }
+
+    /** 平衡：-1 全左 .. 0 居中 .. +1 全右。 */
+    public void setBalance(float b) { channelRouter.setBalance(b); }
+    public float balance() { return channelRouter.balance(); }
+
+    /** 左声道独立音量 0..1（不动系统音量）。 */
+    public void setLeftGain(float g) { channelRouter.setLeftGain(g); }
+    public float leftGain() { return channelRouter.leftGain(); }
+
+    /** 右声道独立音量 0..1（不动系统音量）。 */
+    public void setRightGain(float g) { channelRouter.setRightGain(g); }
+    public float rightGain() { return channelRouter.rightGain(); }
+
+    /**
+     * ★ 2026-11-12：本机播放增益 0~2（1.0 原样、2.0 放大一倍）。
+     *
+     * <p>不再走 {@code AudioTrack.setVolume}：那个上限只有 1.0，用户说"100% 还是偏小"
+     * 就没法再往上给了。乘在样本上 + 软削顶，才能真正放大。
+     */
+    public void setOutVolume(float v) { channelRouter.setVolume(v); }
+
+    public float outVolume() { return channelRouter.volume(); }
+
+    /** 一键还原立体声 / 居中 / 左右 100%。 */
+    public void resetChannels() { channelRouter.reset(); }
+
+    /** 诊断报告里的一行。 */
+    public String channelText() { return channelRouter.text(); }
+
+    /**
+     * 设定某一台来源设备进哪只耳朵（0 双 / 1 左 / 2 右），立刻生效。
+     *
+     * <p>和 {@link #setHostGain} 一样用写时复制的不可变 map：收包线程每包要读一次，
+     * 不能让它抢锁。已经建立的流同步更新，正在缓冲里的槽位下一包起就是新声道。
+     */
+    public void setHostChannel(String host, int ch) {
+        if (host == null || host.isEmpty()) {
+            return;
+        }
+        int v = (ch == 1 || ch == 2) ? ch : 0;
+        Map<String, Integer> next = new HashMap<>(hostChannel);
+        if (v == 0) {
+            next.remove(host);       // 双耳 = 默认，不必占条目
+        } else {
+            next.put(host, v);
+        }
+        hostChannel = Collections.unmodifiableMap(next);
+        for (Stream s : streams) {
+            if (host.equals(s.host)) {
+                s.channel = v;
+            }
+        }
+    }
+
+    /** 某一台现在的声道分配（0 双 / 1 左 / 2 右）。 */
+    public int hostChannel(String host) {
+        Integer v = hostChannel.get(host);
+        return v == null ? 0 : v;
+    }
+
+    /** 新建流时把用户设过的声道带上（不然重连后又会双耳出声）。 */
+    private int channelFor(String host) {
+        Integer v = hostChannel.get(host);
+        return v == null ? 0 : v;
+    }
+
+    private void bump(int idx) {
+        synchronized (counters) {
+            counters[idx]++;
+        }
+    }
+
+    /**
+     * ★ 记一个坏包：总数 + 分类 + 来源 IP + 整包长度。
+     *
+     * @param idx 分类下标（0 = 其它/解码失败，8..12 见 counters 的注释）
+     * @param host 来源地址（记不住就算了，不影响计数）
+     * @param len 整包字节数（长度是最有效的"指纹"，见 {@link Stats#badByLen}）
+     */
+    private void bumpBad(int idx, String host, int len) {
+        synchronized (counters) {
+            counters[4]++;
+            if (idx > 0) {
+                counters[idx]++;
+            }
+            if (host != null && !host.isEmpty()) {
+                Long c = badBySource.get(host);
+                badBySource.put(host, (c == null ? 0L : c) + 1L);
+                // 只有收包线程写；上限 8 个来源，超了就丢最老的那个。
+                while (badBySource.size() > 8) {
+                    java.util.Iterator<String> it = badBySource.keySet().iterator();
+                    if (!it.hasNext()) {
+                        break;
+                    }
+                    it.next();
+                    it.remove();
+                }
+            }
+            if (len > 0) {
+                Integer key = len;
+                Long c = badByLen.get(key);
+                badByLen.put(key, (c == null ? 0L : c) + 1L);
+                while (badByLen.size() > 8) {
+                    java.util.Iterator<Integer> it = badByLen.keySet().iterator();
+                    if (!it.hasNext()) {
+                        break;
+                    }
+                    it.next();
+                    it.remove();
+                }
+            }
+        }
+    }
+
+    private static String normalizeHost(InetAddress a) {
+        if (a == null) {
+            return "";
+        }
+        String h = a.getHostAddress();
+        if (h == null) {
+            return "";
+        }
+        int slash = h.indexOf('/');
+        if (slash >= 0) {
+            h = h.substring(slash + 1);
+        }
+        if (h.startsWith("::ffff:")) {
+            h = h.substring(7);
+        }
+        return h;
+    }
+
+    @SuppressWarnings("deprecation")
+    private void acquireWifiLock() {
+        if (appCtx == null || wifiLock != null) {
+            return;
+        }
+        try {
+            WifiManager wm = (WifiManager) appCtx.getSystemService(Context.WIFI_SERVICE);
+            if (wm == null) {
+                return;
+            }
+            // 29 起有 LOW_LATENCY 模式（明确告诉系统"这是实时音频"），老系统只有 HIGH_PERF。
+            int mode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                    ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                    : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+            WifiManager.WifiLock l = wm.createWifiLock(mode, "audiomixing-recv");
+            l.setReferenceCounted(false);
+            l.acquire();
+            wifiLock = l;
+        } catch (Exception e) {
+            note("WifiLock 获取失败（继续接收，只是息屏后可能变抖）：" + e);
+        }
+    }
+
+    private void releaseWifiLock() {
+        WifiManager.WifiLock l = wifiLock;
+        wifiLock = null;
+        if (l != null) {
+            try {
+                if (l.isHeld()) {
+                    l.release();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private void note(String msg) {
+        lastError = msg;
+        Log.w(TAG, msg);
+    }
+
+    private static void sleepQuiet(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}

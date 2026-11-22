@@ -1,0 +1,23 @@
+# 构建产物
+build/
+*.apk
+*.idsig
+*.class
+# 发布包放行：releases 目录里的 APK 是给开源用户下载的正式产物，需要入库
+!releases/*.apk
+
+# Gradle
+.gradle/
+local.properties
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log

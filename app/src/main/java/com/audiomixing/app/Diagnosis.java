@@ -1,0 +1,1322 @@
+package com.audiomixing.app;
+
+import android.content.Context;
+import android.content.pm.PackageInfo;
+import android.os.Build;
+import android.os.SystemClock;
+
+import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.List;
+import java.util.Locale;
+
+/**
+ * 诊断报告 + 「对端统计」的数据模型与解析。
+ *
+ * <p><b>为什么要有这个类</b>：真机排查时最痛苦的不是没声音，而是<b>不知道是哪一端的问题</b> ——
+ * 是对方没在发，还是我这边没在收？以前只能靠截图里的几个数字猜。所以这里做两件事：
+ * <ol>
+ *   <li>{@link #build(Context)}：把这一刻的全部状态拼成一段纯文本，用户点一下「复制」就能发出来；</li>
+ *   <li>{@link PeerStats}：两台设备互相交换的那份统计（对方自己说"我发了多少、是不是正在发"），
+ *       界面据此直接显示「对方：没在发 ✗（对方那台要点「送声音」）」。</li>
+ * </ol>
+ *
+ * <p><b>为什么 JSON 自己手写而不引第三方库</b>：这个工程是零依赖的（没有 appcompat，也没有
+ * Gson/org.json 的习惯用法），而且 {@link #parse} 要能在<b>纯 JVM 里跑单测</b> ——
+ * 所以整个类里 Android 的调用只出现在 {@link #build(Context)} 这条链上，
+ * 数据的生成与解析只用 {@code java.*}。
+ *
+ * <p><b>解析的底线</b>：Wi-Fi 上什么怪包都有（截断的、乱码的、别人扫端口塞的）。
+ * {@link #parse} 对任何输入都<b>只返回 null，绝不抛异常</b> —— 它跑在收包线程上，
+ * 抛一次就可能让"收听"整条链路停摆。调用方（Engine）另外再兜一层 try/catch。
+ */
+public final class Diagnosis {
+
+    private Diagnosis() {
+    }
+
+    /** 统计包的标识，对应负载里的 {@code "t"} 字段。 */
+    public static final String TAG_STATS = "stats";
+
+    /**
+     * 对端统计多久算过期：对方每 2 秒发一次，6 秒没更新就当它"没在回话"。
+     * 这个值不能太短（Wi-Fi 抖动丢一两个包很正常，太短会闪），也不能太长（对方真的走了要看出来）。
+     */
+    public static final long PEER_TTL_MS = 6000L;
+
+    /** 统计负载的长度上限：正常只有两三百字节，超过这个数的一律当坏包（防止有人塞大包）。 */
+    private static final int MAX_PAYLOAD = 4096;
+
+    // ══════════════════════════════ 对端统计的数据模型 ══════════════════════════════
+
+    /**
+     * 对端在它那份统计包里报告的、它那一侧的状态。
+     *
+     * <p>只看它自己的字段：{@code sent/bytes/sending} 是"它发给我多少"，
+     * {@code recv/lost/bufMs} 是"它从我这里收到多少"。两边各存一份，
+     * 于是"谁没在发、谁没收着"一眼就能看出来 —— 这正是用户要的"让俩设备自己交流"。
+     *
+     * <p>对象一旦发布就不再修改（Engine 每次收到新包都换一个新对象），
+     * 所以界面线程读到一半也不会看到"半新半旧"的字段。
+     */
+    public static final class PeerStats implements LinkPolicy.LinkFields {
+        /**
+         * 报告方的节点 id（负载里的 {@code node}）。电脑端一直带，手机端 2.5 起也带。
+         *
+         * <p>★ 2026-11-01：收端必须按它认设备，不能只看来源 IP —— 电脑有双网卡 / VPN 时，
+         * 统计包从哪块网卡发出去、信标里报的是哪块地址，两者可能不是同一个，
+         * 按 IP 存下来的音量就会写进一个界面永远不读的键（用户报的"电脑调音量手机不同步"）。
+         */
+        public String node = "";
+        /** 报告方的地址（Engine 填，是**按 node 反查发现层后**的 peer.host）。 */
+        public String host = "";
+        /** 报告方的名字。 */
+        public String name = "";
+        /** 它发出去的音频包数 / 字节数。 */
+        public long sent;
+        public long bytes;
+        /** 它现在是不是正在送声音（false = 它那台没点「送声音」）。 */
+        public boolean sending;
+        /** 它从我这里收到的包数 / 丢包数。 */
+        public long recv;
+        public long lost;
+        /**
+         * ★ 2026-11-17 晚（用户要求）：它从我这里收到的<b>字节数</b>（{@code "rx_bytes"}）。
+         * 监控页的「接收多少 M」用它 —— 比"包数 × 每包长度"估算准。<b>-1 = 老版本没报</b>。
+         */
+        public long rxBytes = -1;
+        /** 它那条流的缓冲毫秒数（方向绑定：它从"我"这里收到的那条流）。 */
+        public int bufMs;
+        /**
+         * ★ 2026-11-13：它【自己】的接收缓冲（不绑定方向），新增 {@code "my_buf"} 键。
+         *   广播场景里，其他设备都是接收端、在收广播；它们并没有"从看面板的这台"收到流，
+         *   于是老字段 buf_ms 恒为 0 → 面板一直写「没在收」。这个键由每台无条件上报，
+         *   无论从哪台设备看，都能拿到那一台真实的缓冲深度。-1 = 老版本没报。
+         */
+        public int myBufMs = -1;
+        /** 它那边的音频流条数。 */
+        public int streams;
+        /** 它以为的对端地址（我）。 */
+        public String target = "";
+        /** 它发包时的墙钟毫秒（两台手机的时钟不一定一致，只作参考）。 */
+        public long reportTsMs;
+        /** 本机收到这份统计的时刻（elapsedRealtime，用于判断新鲜度；由 Engine 填）。 */
+        public long receivedAtMs;
+
+        // ── ★ 2026-11-12：对端「本机播放」的真实状态（远程控制 + 多台实时同步）──
+        /**
+         * 对端**自己**的声道模式（{@link ChannelRouter#MODE_STEREO} 等）。
+         *
+         * <p>为什么要有：用户在 A 上把 B 设成「仅左」，B 自己的界面、以及第三台 C 看到
+         * B 的那张卡片，都必须跟着变 —— 状态只有 B 自己知道，所以由 B 每 2 秒报一次
+         * （{@code "out_ch"}），谁都不许拿本地猜测冒充。
+         * <b>-1 = 对方根本没报</b>（老版本 / 电脑端），界面照实写「对方不上报」，不伪装成 0。
+         */
+        public int outCh = -1;
+        /**
+         * 对端本机播放音量的百分比 0~100（{@code "out_vol"}）。-1 = 对方没报。
+         *
+         * <p>用整数百分比而不是 0.00~1.00 的小数：{@link #num} 只认整数，
+         * 而这条链路的精度到 1% 就够（再细用户也听不出来），且省掉一次浮点解析。
+         */
+        public int outVol = -1;
+        /**
+         * 对端本机输出延迟的毫秒数 0~300（{@code "out_delay"}）。-1 = 对方没报（老版本/电脑端）。
+         *
+         * <p>★ 2026-11-13：「它的延迟」滑杆就吃这个值 —— 和 out_vol 一个道理，
+         * 延迟的真相只存在于那台设备自己身上，谁都不许拿本地猜测冒充。
+         */
+        public int outDelay = -1;
+
+        /**
+         * ★ 2026-11-17：对端当前补包协议（{@code "nack"}）：0=冗余副本，1=NACK 重传。
+         * -1 = 老版本没报。设备卡片名字后面要实时显示它。
+         */
+        public int nackOn = -1;
+        /**
+         * ★ 2026-11-17：对端当前【配置档位】毫秒（{@code "buf_tier"}），不是实时积压。
+         * -1 = 老版本没报。
+         */
+        public int bufTierMs = -1;
+
+        // ── ★ 2026-10-14 新增两个字段（复用 T_STATS，不加新包类型、不动包头）──
+        /**
+         * 对端是不是在请求我收听它（它正在把声音送给我，希望我自动打开「收听」）。
+         *
+         * <p>幂等：只要它还在送就一直为 true；它停了就自然变 false，不需要额外的"取消"消息。
+         */
+        public boolean wantListen;
+        /**
+         * ★ 2026-11-04（A）：电脑发来的**显式**「请开始/停止接收」。
+         * {@code listenReq} = "start"/"stop"；{@code listenReqId} 单调递增，
+         * 同一个号只处理一次。手机处理完要在自己的统计里回
+         * {@code listen_ack_id / listen_ack_action / listen_ack_reason}，
+         * 让电脑知道请求到底被做了没有 —— 不能再单向。
+         */
+        public String listenReq = "";
+        public long listenReqId = 0;
+
+        /**
+         * ★ 2026-11-08（用户方案）：电脑发来的"静音档乘数策略"命令
+         * （{@code internal_only} / {@code last_nonzero}）。空串 = 老电脑没发。
+         * {@code silentPolicyReq} 单调递增，手机端只认比上次大的号；
+         * {@code silentPolicyOnly} = 纯设置包，不参与收听/增益判定。
+         */
+        public String silentPolicy = "";
+        public long silentPolicyReq = 0;
+        public boolean silentPolicyOnly;
+
+        /** 我回给对端的 ack（手机端统计里带出去；电脑端读它做诊断）。 */
+        public long listenAckId = 0;
+        public String listenAckAction = "";
+        public String listenAckReason = "";
+        /**
+         * 这条链路（对端→我）的<b>共享音量</b>，0.00~2.00，两端同一个值。
+         * 老版本不发这个字段时按 {@link #GAIN_UNSET} 处理（= 没同步过，保持各自的本地值）。
+         */
+        public float gain = GAIN_UNSET;
+        /** 上面那个值最后一次被修改的墙钟毫秒（谁后改以谁为准）。 */
+        public long gainTs;
+        /**
+         * 对端报的<b>反向</b>共享音量（对端"听我的"那条链路，也就是我"送它的"），
+         * 老版本不发就是 {@link #GAIN_UNSET}。
+         */
+        public float gainRx = GAIN_UNSET;
+        public long gainRxTs;
+
+        /** 这份统计还新鲜吗（{@code nowMs} 用 elapsedRealtime）。 */
+        public boolean fresh(long nowMs) {
+            return receivedAtMs > 0 && (nowMs - receivedAtMs) <= PEER_TTL_MS;
+        }
+
+        /** 距今多少毫秒（给报告里写"1.2 秒前"）。 */
+        public long ageMs(long nowMs) {
+            return receivedAtMs <= 0 ? -1 : (nowMs - receivedAtMs);
+        }
+
+        /** 对端有没有报过共享音量。 */
+        public boolean hasGain() {
+            return gain != GAIN_UNSET;
+        }
+
+        // ── LinkPolicy.LinkFields 的实现：新字段的落点（解析在 LinkPolicy 里，纯逻辑好测）──
+
+        @Override
+        public void setWantListen(boolean v) {
+            wantListen = v;
+        }
+
+        @Override
+        public void setGain(float g, long ts, boolean unset) {
+            gain = unset ? GAIN_UNSET : g;
+            gainTs = ts;
+        }
+
+        @Override
+        public void setGainRx(float g, long ts, boolean unset) {
+            gainRx = unset ? GAIN_UNSET : g;
+            gainRxTs = ts;
+        }
+    }
+
+    /** "对端没报共享音量"的哨兵值（合法的增益是 0.00~2.00，负数不可能撞上）。 */
+    public static final float GAIN_UNSET = -1f;
+
+    // ══════════════════════════════ 生成统计负载 ══════════════════════════════
+
+    /**
+     * 拼一个统计包负载。字段名严格按 task 约定，末尾多带一个 {@code v}（协议版本）和
+     * {@code ts}（发送时刻），这样以后加字段不会把老版本解析弄崩。
+     *
+     * <p>为什么用 UTF-8 手写：解析方就是本类的 {@link #parse}，两边同一份代码、
+     * 同一套转义规则，比引一个 JSON 库可控得多（也能在纯 JVM 里对拍）。
+     */
+    public static byte[] json(String name, long sent, long bytes, boolean sending,
+                              long recv, long lost, int bufMs, int streams, String target) {
+        return json(name, sent, bytes, sending, recv, lost, bufMs, streams, target,
+                false, GAIN_UNSET, 0L);
+    }
+
+    /**
+     * ★ 带"请求收听 + 共享音量"两个新字段的版本（2026-10-14，task-17）。
+     *
+     * <p><b>协议约定（和电脑端 task-16 对齐用）</b>：不新增包类型、不改包头，
+     * 就在现有 {@code T_STATS}(ptype=7) 的 JSON 负载里多加三个字段：
+     * <ul>
+     *   <li>{@code "want_listen": true|false} —— 发送方正在把声音送给对端，<b>请求对端自动打开收听</b>。
+     *       幂等：还在送就一直是 true，停了自然变 false（不需要额外的取消消息）。</li>
+     *   <li>{@code "gain": 0.00~2.00} —— 这条链路（发送方→接收方）的<b>共享音量</b>，两端同一个值。</li>
+     *   <li>{@code "gain_ts": <墙钟毫秒>} —— 该值最后一次被修改的时刻，用来判"谁后改以谁为准"。</li>
+     * </ul>
+     * 老版本收到这些字段<b>当未知字段忽略即可</b>（我们的 {@link #parse} 也只读自己认识的键），
+     * 所以新旧版本可以混跑，不会崩。
+     */
+    public static byte[] json(String name, long sent, long bytes, boolean sending,
+                              long recv, long lost, int bufMs, int streams, String target,
+                              boolean wantListen, float gain, long gainTs) {
+        return json(name, sent, bytes, sending, recv, lost, bufMs, streams, target,
+                wantListen, gain, gainTs, GAIN_UNSET, 0L, false);
+    }
+
+    /**
+     * ★ 带"请求收听 + 双向共享音量"字段的完整版本（2026-10-14，task-17）。
+     *
+     * <p><b>协议约定（拿去和电脑端 task-16 对齐）</b>：不新增包类型、不改包头，
+     * 就在现有 {@code T_STATS}(ptype=7) 的 JSON 负载里多加这几个字段：
+     * <ul>
+     *   <li>{@code "want_listen": true|false} —— 我正把声音送给对端，<b>请求对端自动打开收听</b>；
+     *       幂等（还在送就一直 true，停了自然 false，不需要额外的取消消息）。</li>
+     *   <li>{@code "gain": 0.00~2.00} + {@code "gain_ts": <墙钟毫秒>} ——
+     *       <b>我→对端</b>这条链路的共享音量（= 我这边的"我送它的"，= 对端那边的"我听它的"）。</li>
+     *   <li>{@code "gain_rx": 0.00~2.00} + {@code "gain_rx_ts": <墙钟毫秒>} ——
+     *       <b>对端→我</b>这条链路的共享音量（= 我这边的"我听它的"，= 对端那边的"我送它的"）。</li>
+     * </ul>
+     * 规则：一个增益两端同一个值，谁后改以谁为准（比 {@code *_ts}）；值一样就什么都不做，
+     * 所以不会来回弹。老版本收到这些字段当未知字段忽略即可，可以新旧混跑。
+     */
+    public static byte[] json(String name, long sent, long bytes, boolean sending,
+                              long recv, long lost, int bufMs, int streams, String target,
+                              boolean wantListen, float gain, long gainTs,
+                              float gainRx, long gainRxTs, boolean wantBt) {
+        return json("", name, sent, bytes, sending, recv, lost, bufMs, streams, target,
+                wantListen, gain, gainTs, gainRx, gainRxTs, wantBt);
+    }
+
+    /**
+     * ★ 2026-11-01：把本机的 node id 也报上去（`"node"` 字段）。
+     *
+     * <p>电脑端（v2.12 也是）一直优先读 `node`，读不到才按来源 IP 去发现表反查。
+     * 反查要求"信标里的地址 == 统计包的来源地址"，换网卡 / 走 VPN / 手机改了 Wi-Fi
+     * 时这条就会落空 —— 后果是**两端音量条不同步、智连也收不到**（用户截图里
+     * 电脑 1.00 / 手机 0.59 就是这个）。手机自己把 id 报上来，这条路不依赖 IP 反查，
+     * 旧电脑也能立刻用上。
+     */
+    public static byte[] json(String nodeId, String name, long sent, long bytes, boolean sending,
+                              long recv, long lost, int bufMs, int streams, String target,
+                              boolean wantListen, float gain, long gainTs,
+                              float gainRx, long gainRxTs, boolean wantBt) {
+        return json(nodeId, name, sent, bytes, sending, recv, lost, bufMs, streams, target,
+                wantListen, gain, gainTs, gainRx, gainRxTs, wantBt, -1f);
+    }
+
+    /**
+     * ★ 2026-11-03 Q3：多带一个 {@code "vol"} —— 手机当前的**媒体/App 音量**（0.00~1.00）。
+     *
+     * <p>用途：手机在「送声音」时，电脑端把"我听它的"增益再乘以这个值，
+     * 于是手机按音量键/拖 App 音量条，PC 耳机里听到的手机声音会同步变化。
+     * 它只是一个"衰减系数"（≤1），所以永远不会超过用户在电脑上设的音量上限。
+     *
+     * <p>协议上仍然只是 T_STATS 的 JSON 多一个键，不改包头、不新增包类型；
+     * 老电脑把它当未知字段忽略，老手机不发这个键时电脑按 1.0 处理 —— 新旧混跑行为不变。
+     */
+    public static byte[] json(String nodeId, String name, long sent, long bytes, boolean sending,
+                              long recv, long lost, int bufMs, int streams, String target,
+                              boolean wantListen, float gain, long gainTs,
+                              float gainRx, long gainRxTs, boolean wantBt, float mediaVolume) {
+        return json(nodeId, name, sent, bytes, sending, recv, lost, bufMs, streams, target,
+                wantListen, gain, gainTs, gainRx, gainRxTs, wantBt, mediaVolume, -1, false);
+    }
+
+    /**
+     * ★ 2026-11-04（Q3）：多带 {@code "send_mode"}（0/1/2）与 {@code "broadcast"}。
+     *
+     * <p>这是电脑端准入判据的**显式声明**：广播就是广播，点对点就是点对点 ——
+     * 电脑不再拿 {@code want_listen} 去推断（那个字段在广播时可能残留为 true，
+     * 曾把广播流误判成"未接受的点对点"直接丢掉）。
+     *
+     * <p>老电脑把它当未知键忽略（解析只读认识的键）；老手机不发时电脑按
+     * "拿不到声明" 处理 —— 退化行为必须是**能听**（详见电脑端 engine.py 的注释）。
+     */
+    public static byte[] json(String nodeId, String name, long sent, long bytes, boolean sending,
+                              long recv, long lost, int bufMs, int streams, String target,
+                              boolean wantListen, float gain, long gainTs,
+                              float gainRx, long gainRxTs, boolean wantBt, float mediaVolume,
+                              int sendMode, boolean broadcast) {
+        return json(nodeId, name, sent, bytes, sending, recv, lost, bufMs, streams, target,
+                wantListen, gain, gainTs, gainRx, gainRxTs, wantBt, mediaVolume, sendMode,
+                broadcast, "", "", "");
+    }
+
+    /**
+     * ★ 2026-11-08：把"音量乘数由送声档位决定"这件事显式报给电脑。
+     *
+     * <ul>
+     *   <li>{@code vol_mode}/{@code vol_source}：{@code external}（外放档，手机乘了
+     *       STREAM_MUSIC）或 {@code silent}（静音档，手机不再叠加）；</li>
+     *   <li>{@code vol_in_capture}：按档位**真实取值** —— 外放档 false、静音档 true；</li>
+     *   <li>{@code vol_policy}：静音档乘数策略（internal_only / last_nonzero）。</li>
+     * </ul>
+     * 电脑端看到 {@code vol_source} 就知道"手机已经处理过"，系数恒为 1.0 ——
+     * 两端合计只乘一次。老手机不发这些键时保持 {@code vol_in_capture:true}（v2.28 行为）。
+     */
+    public static byte[] json(String nodeId, String name, long sent, long bytes, boolean sending,
+                              long recv, long lost, int bufMs, int streams, String target,
+                              boolean wantListen, float gain, long gainTs,
+                              float gainRx, long gainRxTs, boolean wantBt, float mediaVolume,
+                              int sendMode, boolean broadcast,
+                              String volMode, String volSource, String volPolicy) {
+        StringBuilder sb = new StringBuilder(256);
+        sb.append("{\"t\":\"").append(TAG_STATS).append("\",\"v\":1");
+        if (nodeId != null && nodeId.length() > 0) {
+            sb.append(",\"node\":\"").append(escape(nodeId)).append('"');
+        }
+        sb.append(",\"name\":\"").append(escape(name)).append('"');
+        sb.append(",\"sent\":").append(sent);
+        sb.append(",\"bytes\":").append(bytes);
+        sb.append(",\"sending\":").append(sending);
+        sb.append(",\"recv\":").append(recv);
+        sb.append(",\"lost\":").append(lost);
+        sb.append(",\"buf_ms\":").append(bufMs);
+        sb.append(",\"streams\":").append(streams);
+        sb.append(",\"target\":\"").append(escape(target)).append('"');
+        // ★ 新字段：老版本会忽略，不影响它们
+        sb.append(",\"want_listen\":").append(wantListen);
+        // ★ ④ 2026-10-15 新增：用户点了「走蓝牙」→ 请**电脑**去连我的蓝牙
+        //   （用户原话：「手机确认走蓝牙后应当由电脑发送蓝牙请求并配对互相连接」）。
+        //   幂等：只是"请电脑去连"，电脑那边自己节流；用户改回 WiFi 时自然变 false。
+        sb.append(",\"want_bt\":").append(wantBt);
+        if (gain != GAIN_UNSET) {
+            sb.append(",\"gain\":").append(gainText(gain));
+            sb.append(",\"gain_ts\":").append(gainTs);
+        }
+        if (gainRx != GAIN_UNSET) {
+            sb.append(",\"gain_rx\":").append(gainText(gainRx));
+            sb.append(",\"gain_rx_ts\":").append(gainRxTs);
+        }
+        // ★ 2026-11-03 Q3：媒体/App 音量（0..1）。老电脑忽略即可。
+        if (mediaVolume >= 0f && mediaVolume <= 1f) {
+            sb.append(",\"vol\":").append(gainText(mediaVolume));
+            // ★ 2026-11-08：手机显式声明"这一级是怎么处理的"（外放档乘、静音档不乘）。
+            //   电脑端看 vol_source 就知道已经处理过，系数恒为 1.0 —— 合计只乘一次。
+            String src = SendVolume.MODE_SILENT.equals(volSource)
+                    ? SendVolume.MODE_SILENT
+                    : (SendVolume.MODE_EXTERNAL.equals(volSource) ? SendVolume.MODE_EXTERNAL : "");
+            if (src.isEmpty()) {
+                sb.append(",\"vol_in_capture\":true");
+            } else {
+                boolean silent = SendVolume.MODE_SILENT.equals(src);
+                sb.append(",\"vol_mode\":\"").append(silent
+                        ? SendVolume.MODE_SILENT : SendVolume.MODE_EXTERNAL).append('"');
+                sb.append(",\"vol_source\":\"").append(src).append('"');
+                // 按档位真实取值：外放档 false（手机乘了系统音量）、静音档 true（手机不再叠加）。
+                sb.append(",\"vol_in_capture\":").append(silent);
+                String policy = SendVolume.normalizePolicy(volPolicy);
+                sb.append(",\"vol_policy\":\"").append(policy).append('"');
+            }
+        }
+        // ★ 2026-11-04（Q3）：显式声明送声音档位与"是不是广播线路"。
+        //   电脑端准入只认这两个键，不再从 want_listen 推断（广播时那个字段可能残留 true）。
+        if (sendMode >= 0) {
+            sb.append(",\"send_mode\":").append(sendMode);
+            sb.append(",\"broadcast\":").append(broadcast);
+        }
+        sb.append(",\"ts\":").append(System.currentTimeMillis());
+        sb.append('}');
+        return sb.toString().getBytes(StandardCharsets.UTF_8);
+    }
+
+    /** 增益写成两位小数（"0.77"）—— 不要写成 "0.7700000001" 那种。 */
+    static String gainText(float g) {
+        return String.format(java.util.Locale.US, "%.2f", g);
+    }
+
+    /**
+     * ★ 2026-11-12：把本机播放状态拼成统计包里的两个键（{@code "out_ch"} / {@code "out_vol"}）。
+     *
+     * <p>为什么做成「片段」而不是再加一层 {@link #json} 重载：这一层的重载已经叠了六层，
+     * 每多一个字段就多一层、调用点还很容易按位置传错。片段是在现有 JSON 收尾前插进去的
+     * （和 {@code listenAckJson} 同一个做法），老版本解析只读它认识的键，多两个完全无害。
+     *
+     * @param mode        {@link ChannelRouter} 的 MODE_*（0~4）
+     * @param volPercent  本机播放音量 0~100
+     * @param delayMs     本机输出延迟 0~300
+     */
+    public static String outStateJson(int mode, int volPercent, int delayMs, int myBufMs,
+                                      int nackOn, int bufTierMs) {
+        int m = (mode >= ChannelRouter.MODE_STEREO && mode <= ChannelRouter.MODE_SEND_MUTE)
+                ? mode : ChannelRouter.MODE_STEREO;
+        int v = Math.max(0, Math.min(100, volPercent));
+        int d = Math.max(0, delayMs);
+        int b = Math.max(0, myBufMs);
+        return ",\"out_ch\":" + m + ",\"out_vol\":" + v + ",\"out_delay\":" + d
+                + ",\"my_buf\":" + b
+                // ★ 2026-11-17：补包协议 + 配置档位（设备卡片名字后面实时显示）。
+                + ",\"nack\":" + (nackOn != 0 ? 1 : 0)
+                + ",\"buf_tier\":" + Math.max(0, bufTierMs);
+    }
+
+    // ══════════════════════════════ 解析统计负载 ══════════════════════════════
+
+    /**
+     * 解析对端发来的统计负载。
+     *
+     * <p><b>任何异常输入都返回 null，绝不抛</b>：这个方法跑在收包线程上（Engine 的监听器里），
+     * 真机上会收到截断包、乱码、别人扫描端口的垃圾，抛一次就可能把"收听"整条链路带走。
+     *
+     * <p>故意不用 org.json：一是能在纯 JVM 单测里跑，二是这里的解析要"能读多少读多少"，
+     * 库的严格校验在局域网里反而是负担。
+     */
+    public static PeerStats parse(byte[] raw, int len) {
+        try {
+            if (raw == null || len <= 0 || len > MAX_PAYLOAD) {
+                return null;
+            }
+            if (len > raw.length) {
+                len = raw.length;
+            }
+            String s = new String(raw, 0, len, StandardCharsets.UTF_8);
+            if (s.indexOf('{') < 0 || s.indexOf('}') < 0) {
+                return null;                     // 不是对象形状，直接当垃圾
+            }
+            String t = str(s, "t");
+            if (t != null && !TAG_STATS.equals(t)) {
+                return null;                     // 自称是别的类型（以后可能有别的控制包）
+            }
+            PeerStats ps = new PeerStats();
+            // ★ 2026-11-01：电脑的统计包一直带 node；手机自己也会带。
+            //   收端按它认设备，不再依赖"来源 IP == 信标 IP"（多网卡/VPN 时那两条会不一样）。
+            ps.node = nz(str(s, "node"));
+            ps.name = nz(str(s, "name"));
+            ps.sent = num(s, "sent", 0);
+            ps.bytes = num(s, "bytes", 0);
+            ps.sending = bool(s, "sending", false);
+            ps.recv = num(s, "recv", 0);
+            ps.lost = num(s, "lost", 0);
+            // ★ 2026-11-17 晚：它从我这里收到的字节数（老版本没有这个键 → -1 = 未上报）
+            ps.rxBytes = (long) clamp(num(s, "rx_bytes", -1), -1, Long.MAX_VALUE / 4);
+            ps.bufMs = (int) clamp(num(s, "buf_ms", 0), 0, 60000);
+            // ★ 2026-11-13：老版本没有这个键 → 保持 -1 = 未上报
+            ps.myBufMs = (int) clamp(num(s, "my_buf", -1), -1, 60000);
+            ps.streams = (int) clamp(num(s, "streams", 0), 0, 10000);
+            ps.target = nz(str(s, "target"));
+            ps.reportTsMs = num(s, "ts", 0);
+            // ★ 2026-11-12：对端本机播放状态（老版本/电脑端没有这两个键 → 保持 -1 = 未上报）
+            ps.outCh = (int) clamp(num(s, "out_ch", -1), -1, ChannelRouter.MODE_SEND_MUTE);
+            ps.outVol = (int) clamp(num(s, "out_vol", -1), -1, 100);
+            // ★ 2026-11-13：对端本机输出延迟（老版本没有这个键 → 保持 -1 = 未上报）
+            ps.outDelay = (int) clamp(num(s, "out_delay", -1), -1, AudioRecv.MAX_EXTRA_DELAY_MS);
+            // ★ 2026-11-17：对端补包协议 + 配置档位（老版本没有 → -1 = 未上报，界面照实写"旧版"）
+            ps.nackOn = (int) clamp(num(s, "nack", -1), -1, 1);
+            ps.bufTierMs = (int) clamp(num(s, "buf_tier", -1), -1, 60000);
+            // ★ 2026-11-04（A）：显式接收请求 + 请求号（老电脑没有这两个键 → 空/0）。
+            ps.listenReq = nz(str(s, "listen_req"));
+            ps.listenReqId = num(s, "listen_req_id", 0);
+            // ★ 2026-11-08：电脑切换"静音档乘数策略"用同一份 T_STATS 负载。
+            ps.silentPolicy = nz(str(s, "silent_vol_policy"));
+            ps.silentPolicyReq = num(s, "silent_vol_policy_req", 0);
+            ps.silentPolicyOnly = bool(s, "silent_vol_policy_only", false);
+            // 对端回给我的 ack（手机端自己发统计时也会带；电脑端读它）。
+            ps.listenAckId = num(s, "listen_ack_id", 0);
+            ps.listenAckAction = nz(str(s, "listen_ack_action"));
+            ps.listenAckReason = nz(str(s, "listen_ack_reason"));
+            // ★ 新字段（want_listen / gain / gain_ts / gain_rx / gain_rx_ts）交给 LinkPolicy 读：
+            //   那段是纯逻辑，有专门的离线门禁逐条断言；老版本没有这些键时它什么都不做。
+            LinkPolicy.readLinkFields(s, ps);
+            // 什么都不像：不是我们的统计包（比如一段纯文本里正好有个 {}）。
+            if (t == null && ps.name.isEmpty() && ps.sent == 0 && ps.recv == 0 && !ps.sending) {
+                return null;
+            }
+            return ps;
+        } catch (Throwable t) {
+            return null;                          // 手写解析也可能有边界情况，兜底不留隐患
+        }
+    }
+
+    public static PeerStats parse(byte[] raw) {
+        return raw == null ? null : parse(raw, raw.length);
+    }
+
+    // ══════════════════════════════ 界面那一行文字 ══════════════════════════════
+
+    /**
+     * 设备卡片里的「对方」那一行。用户要的原话就是这三种状态：
+     * 「已发 5938 包 / 11.0 MB · 正在发 ✓」/「没在发 ✗」/「等它回话」。
+     *
+     * @param nowMs 用 {@code SystemClock.elapsedRealtime()} 取的当前时刻
+     */
+    public static String cardLine(PeerStats ps, long nowMs) {
+        if (ps == null) {
+            return "对方：等它回话…（它每 2 秒会回一次）";
+        }
+        if (!ps.fresh(nowMs)) {
+            long age = ps.ageMs(nowMs);
+            return "对方：没在回话 ✗（最后一句是 " + (age < 0 ? "?" : (age / 1000) + " 秒前")
+                    + "，那台的 App 还在跑吗？）";
+        }
+        StringBuilder sb = new StringBuilder(96);
+        sb.append("对方：");
+        if (ps.sending) {
+            sb.append("已发 ").append(ps.sent).append(" 包 / ").append(bytesText(ps.bytes))
+                    .append(" · 正在发 ✓");
+        } else {
+            sb.append("没在发 ✗（对方那台要点「送声音」）");
+            if (ps.sent > 0) {
+                sb.append("（之前发过 ").append(ps.sent).append(" 包 / ")
+                        .append(bytesText(ps.bytes)).append("）");
+            }
+        }
+        // 对方报告的"它收了我多少"：这是判断"我发出去的声音到底到没到"的唯一依据。
+        sb.append(" · 它收 ").append(ps.recv).append(" 包 丢 ").append(ps.lost)
+                .append(" 缓冲 ").append(ps.bufMs).append("ms");
+        return sb.toString();
+    }
+
+    /** 详情面板里的「对端回话」多行文字。 */
+    public static String peersSummary(List<PeerStats> list, long nowMs) {
+        if (list == null || list.isEmpty()) {
+            return "还没收到任何对端的统计回话";
+        }
+        StringBuilder sb = new StringBuilder(256);
+        for (PeerStats ps : list) {
+            sb.append(ps.host);
+            if (ps.name != null && ps.name.length() > 0) {
+                sb.append("（").append(ps.name).append("）");
+            }
+            sb.append(' ').append(cardLine(ps, nowMs)).append('\n');
+        }
+        if (sb.length() > 0) {
+            sb.setLength(sb.length() - 1);
+        }
+        return sb.toString();
+    }
+
+    // ══════════════════════════════ 诊断报告 ══════════════════════════════
+
+    /**
+     * 生成完整报告。纯函数：只读状态、只返回字符串，不启线程、不改任何开关
+     * （所以以后加单测可以直接对着它断言）。
+     */
+    public static String build(Context ctx) {
+        // peek() 而不是 get()：诊断不该顺手把引擎建起来（那会真的去开组播端口）。
+        return build(ctx, Engine.peek());
+    }
+
+    /** 报告主体。{@code e} 允许为 null（引擎还没起来时也要能出报告）。 */
+    public static String build(Context ctx, Engine e) {
+        long nowUp = SystemClock.elapsedRealtime();
+        StringBuilder sb = new StringBuilder(2048);
+        sb.append("========== AudioFlow-LR 诊断/关于报告 ==========\n");
+        sb.append("生成时间：").append(timeText(System.currentTimeMillis())).append('\n');
+        sb.append("App     ：").append(appVersion(ctx)).append('\n');
+        sb.append("系统    ：").append(androidVersion()).append('\n');
+        sb.append("已运行  ：").append(durationText(nowUp)).append('\n');
+
+        if (e == null) {
+            sb.append("\n【引擎没在运行】\n")
+                    .append("App 还没启动过，或者进程刚被系统回收。\n")
+                    .append("（打开 App 主界面即可让引擎跑起来，设备列表要它在才看得到。）\n");
+            return sb.toString();
+        }
+
+        // ── 本机 ──
+        sb.append("\n【本机】\n");
+        sb.append("名称    ：").append(e.nodeName())
+                .append(e.localNameIsCustom() ? "（用户自定义）" : "（默认名，同型号用后缀区分）")
+                .append('\n');
+        sb.append("平台    ：").append(e.platform()).append('\n');
+        sb.append("本机 IP ：").append(e.localIpsText()).append('\n');
+        sb.append("音频端口：").append(e.audioPort()).append("（UDP，收发都用它）\n");
+        sb.append("收听名单：").append(e.listeningCount()).append(" 台 → ")
+                .append(e.listenTargetsText()).append('\n');
+        // ★ 听广播（频道）：这是"电脑在广播、手机要能听见"的唯一入口，报告里必须有。
+        sb.append("听广播  ：").append(e.isChannelListening() ? "已打开 ✓（谁来都听）" : "没开 ✗").append('\n');
+        // ★ ① 自动收听（2026-10-18 用户第 6 条）：改由每台设备各自的「智连」开关决定
+        //   （默认全关），不再有全局总开关 —— 所以报告里列出当前开了「智连」的那几台。
+        {
+            StringBuilder smart = new StringBuilder();
+            for (Discovery.Peer p : e.peers()) {
+                if (p != null && e.isSmart(p.host)) {
+                    if (smart.length() > 0) {
+                        smart.append('、');
+                    }
+                    smart.append(p.label());
+                }
+            }
+            sb.append("智连    ：").append(smart.length() == 0
+                    ? "一台都没开 ✗（别人点「送给它」我不会自动听）"
+                    : (smart + " ✓（这几台送声音过来我会自动开始听）")).append('\n');
+        }
+        // ★ 广播我的声音（发出去）：一次采集 → 一包编码 → 分发给 N 个目标。
+        sb.append("发广播  ：").append(e.isBroadcasting() ? "已打开 ✓（送给每一台在线设备）" : "没开 ✗")
+                .append('\n');
+        sb.append("送声目标：").append(e.sendTargetText()).append('\n');
+        sb.append("带宽    ：").append(e.bandwidthText()).append('\n');
+        // ★ 2026-11-17（用户要求）：补包协议状态 + 命中计数——一眼看出 NACK 机制有没有真在跑。
+        sb.append("补包协议：").append(e.nackEnabled() ? "NACK 重传（低延迟）" : "冗余副本（稳）").append('\n');
+        // ★ 2026-11-17 晚：NACK 的缓冲固定 500ms（没有档位可选），报告里要写清楚，
+        //   否则以后看报告的人会以为"档位被人改坏了"。
+        sb.append("本机缓冲：").append(e.recvBufMs()).append("ms")
+                .append(e.nackEnabled() ? "（NACK 固定值，不可调）\n" : "（冗余副本档位）\n");
+        // ★ 2026-11-17 晚：延迟按补包协议各记一套，报告里标出当前用的是哪一套。
+        sb.append("本机延迟：").append(e.outDelayMs()).append("ms")
+                .append(e.nackEnabled() ? "（NACK 模式的记忆值）\n" : "（冗余副本模式的记忆值）\n");
+        sb.append("  我请求补包：").append(e.nackReqSeqs()).append(" 个包 / ")
+                .append(e.nackReqBatches()).append(" 批（接收端发现缺包）\n");
+        sb.append("  我帮别人补：").append(e.nackSentCount()).append(" 个包（发送端响应请求）\n");
+        sb.append("运行状态：发现 ").append(onOff(e.discoveryRunning()))
+                .append(" / 接收器 ").append(onOff(e.receiverRunning()))
+                .append(" / 发送器 ").append(onOff(e.senderRunning())).append('\n');
+        // ★ 音量：把"三层"写清楚。用户明确要求过：我们只负责我们自己这一层，
+        //   绝不能顺手改系统音量（以前的滑杆就是错的）。
+        sb.append("我们这一层：").append(e.volumeText()).append('\n');
+        sb.append("系统音量：").append(e.systemVolumeText()).append('\n');
+        sb.append("音量关系：").append(e.volumeExplainText()).append('\n');
+        // ★ 节点 ID：持久化的，重启不变 —— 电脑端才不会把同一台手机记成好几台设备。
+        sb.append("节点 ID ：").append(e.nodeIdText()).append('\n');
+        sb.append("统计包  ：已发 ").append(e.statsPacketsSent())
+                .append(" 个（每 2 秒一次，收发双方互报）\n");
+
+        // ── ★ 声音来源（送什么）──
+        // 用户被"手机只采了麦克风"误导过一次（那是对讲机，不是他要的桌面音频），
+        // 所以这一段把"选了什么、实际采的是什么、为什么不一致、支不支持、是不是一直静音"
+        // 全部写出来 —— 采不到声音时，这几行就是定性用的证据。
+        sb.append("\n【声音来源（送什么）】\n");
+        sb.append("当前选择：").append(e.sourceNameText()).append('\n');
+        sb.append("实际采集：").append(e.activeSourceText()).append('\n');
+        sb.append("系统支持：").append(e.playbackSupportText()).append('\n');
+        sb.append("授权状态：").append(e.projectionStateText()).append('\n');
+        sb.append("采集格式：").append(e.captureFormatText()).append('\n');
+        sb.append("静音情况：").append(e.silenceText()).append('\n');
+        String srcHint = e.silenceHintText();
+        if (srcHint != null && srcHint.length() > 0) {
+            sb.append("提醒    ：").append(srcHint).append('\n');
+        }
+        String pending = e.pendingSendId();
+        if (pending != null && pending.length() > 0) {
+            sb.append("等待中  ：正在等系统的投屏授权回来（授权后就送给 ").append(pending).append("）\n");
+        }
+        sb.append("（采本机声音的限制：安卓 10 以下没有这个能力；DRM 保护的内容和\n")
+                .append("  主动禁止被采集的 App 采不到，会是静音；少数厂商 ROM 阉割了该接口。）\n");
+
+        // ── 发现 ──
+        sb.append("\n【发现（信标）】\n");
+        sb.append(indent(e.discoveryStatsText())).append('\n');
+        // ★ 把我们真正发出去的信标贴一行：里面有 id / audio_port / 总字节数，
+        //   "电脑那边看到我的 id 是空的"这类怀疑一次就能说清。
+        sb.append("我发的信标：").append(e.beaconPreviewText()).append('\n');
+        List<Discovery.Peer> peers = safePeers(e);
+        sb.append("当前看到 ").append(peers.size()).append(" 台设备：\n");
+        if (peers.isEmpty()) {
+            sb.append("  （一台都没有。两台设备必须连同一个 Wi-Fi；\n")
+                    .append("    有些路由器开了「AP 隔离/客户端隔离」，那样互相永远看不到。）\n");
+        }
+        for (Discovery.Peer p : peers) {
+            sb.append("  · ").append(p.label())
+                    .append("  ").append(p.host).append(':').append(p.audioPort)
+                    .append("  ").append(nz(p.platform));
+            if (p.busy) {
+                sb.append("  [对端忙]");
+            }
+            sb.append('\n');
+        }
+
+        // ── 接收 ──
+        sb.append("\n【接收（我听别人）】\n");
+        AudioRecv.Stats st = e.recvStats();
+        if (st == null) {
+            sb.append("接收器没在运行（没点过任何一台的「🎧 收听」，也没开「📻 听广播」）。\n");
+        } else {
+            sb.append("听广播  ：").append(e.isChannelListening()
+                    ? "开着（接收端不按名单过滤，谁来都听）" : "没开（只收点过「收听」的那几台）").append('\n');
+            // ★ 「开关是意图，这一行才是事实」——用户说的"路由/广播混淆"就靠它对质。
+            sb.append("实际收到：").append(e.recvStreamsText()).append('\n');
+            String dup = e.dupRouteStatsText();
+            if (dup != null && dup.length() > 0) {
+                sb.append("重复流  ：").append(dup).append('\n');
+            }
+            sb.append("已收包  ：").append(st.received).append(" 包\n");
+            sb.append("丢包    ：").append(st.lost).append("（迟到 ").append(st.late)
+                    .append(" · 重复 ").append(st.duplicates).append("）\n");
+            sb.append("坏包    ：").append(st.badPackets).append("（控制包 ").append(st.controls)
+                    .append(" · 按名单过滤 ").append(st.filtered)
+                    .append(" · 自愈 ").append(st.recoveries).append("）\n");
+            // ★ 坏包按原因分开报（2026-10-12 真机反馈）：原来只有一个"坏包 3220"的总数，
+            //   报告里只解释了其中 49 个，剩下 3171 个只能猜 —— 有数字没线索是最难受的排查状态。
+            sb.append("坏包分类：magic 不对 ").append(st.badMagic)
+                    .append(" · 版本不对 ").append(st.badVersion)
+                    .append(" · 包太短 ").append(st.badShort)
+                    .append(" · 编码不是 PCM16 ").append(st.badCodec)
+                    .append(" · 帧长不是 480 ").append(st.badFrames).append('\n');
+            if (st.lastCodecSeen != null && st.lastCodecSeen.length() > 0) {
+                sb.append("对面编码：").append(st.lastCodecSeen).append('\n');
+            }
+            if (st.badBySource != null && st.badBySource.length() > 0) {
+                sb.append("坏包来源：").append(st.badBySource)
+                        .append("（全来自同一台 = 那台在按我们不懂的方式发；"
+                                + "来自很多台 = 多半是这个端口被别的软件/扫描器盯上了）\n");
+            }
+            if (st.badByLen != null && st.badByLen.length() > 0) {
+                sb.append("坏包长度：").append(st.badByLen)
+                        .append("（1948 字节 = 28 字节包头 + 480 帧 PCM16，正是我们一条音频流的长度；"
+                                + "零碎长度多半是别人的杂流量）\n");
+            }
+            appendSample(sb, "最近坏包", st.lastMagicSample);
+            appendSample(sb, "最近编码包", st.lastCodecSample);
+            appendSample(sb, "最近帧长包", st.lastFramesSample);
+            appendSample(sb, "最近短包", st.lastShortSample);
+            appendSample(sb, "最近版本包", st.lastVersionSample);
+            // ★ 对面报的 samples 和负载长度对不上：包照收照播，但这件事必须写成人话 ——
+            //   否则下一个人会以为"包全坏了"去查丢包/编码（2026-10-14 就是这么卡住的一轮）。
+            if (st.samplesMismatch > 0) {
+                sb.append("帧数字段：").append(st.samplesMismatch)
+                        .append(" 个包的 samples 和负载长度对不上 —— ")
+                        .append(nz(st.lastSamplesNote)).append('\n');
+            }
+            sb.append("缓冲    ：").append(st.bufferedMs).append("ms（目标 ")
+                    .append(st.targetMs).append("ms）\n");
+            sb.append("流数    ：").append(st.streamCount).append('\n');
+            sb.append("混音电平：").append(percent(st.peak)).append('\n');
+            if (st.trackErrors > 0) {
+                sb.append("音频轨错误：").append(st.trackErrors).append(" 次\n");
+            }
+            if (st.streams != null && !st.streams.isEmpty()) {
+                sb.append("每条流：\n");
+                for (AudioRecv.StreamStats ss : st.streams) {
+                    sb.append("  · ").append(ss.host)
+                            .append(" 收 ").append(ss.received).append(" 包")
+                            .append(" · 丢 ").append(ss.lost)
+                            .append(" · 缓冲 ").append(ss.bufferedMs).append("ms")
+                            .append(" · 电平 ").append(percent(ss.peak))
+                            .append(" · 我听它的音量 ")
+                            .append(String.format(Locale.US, "%.2f", e.peerRecvGain(ss.host)))
+                            .append(" · 最后一包 ").append(ss.ageMs).append("ms 前\n");
+                }
+            }
+        }
+
+        // ── 发送 ──
+        sb.append("\n【发送（别人听我）】\n");
+        if (!e.senderRunning()) {
+            sb.append("发送器没在运行（没点过任何一台的「送声音」，也没开「📢 广播我的声音」）。\n");
+        } else {
+            sb.append("广播    ：").append(e.isBroadcasting() ? "开着 ✓（送给每一台在线设备）" : "没开").append('\n');
+            sb.append("目标    ：").append(e.sendTargetText()).append('\n');
+            // ★ 送出去的是本机声音还是麦克风，必须在报告里一眼看到（别再让人猜）
+            sb.append("音源    ：").append(e.activeSourceText()).append('\n');
+            sb.append("已发包  ：").append(e.sentPackets()).append(" 包 / ")
+                    .append(bytesText(e.sentBytes())).append("（多目标时是所有目标之和）\n");
+            sb.append("发送失败：").append(e.sendErrors()).append(" 次\n");
+            // ★ 逐目标：广播时"总共发了多少"没用，用户要知道"是哪一台没在收"
+            List<SendFanout.TargetStats> ts = e.sendTargetStats();
+            if (!ts.isEmpty()) {
+                sb.append("每台情况：\n");
+                for (SendFanout.TargetStats t : ts) {
+                    sb.append("  · ").append(t.host).append(':').append(t.port)
+                            .append(" 发 ").append(t.packetsSent).append(" 包 / ")
+                            .append(bytesText(t.bytesSent))
+                            .append(" · 我送它的音量 ")
+                            .append(String.format(Locale.US, "%.2f", t.gain));
+                    if (t.sendErrors > 0) {
+                        sb.append(" · 失败 ").append(t.sendErrors).append(" 次");
+                    }
+                    if (t.lastOkAgeMs < 0) {
+                        sb.append(" · 还没成功发出过 ✗");
+                    } else if (t.lastOkAgeMs > 2000) {
+                        sb.append(" · 最近一次成功 ").append(t.lastOkAgeMs / 1000).append(" 秒前 ✗");
+                    } else {
+                        sb.append(" · 正在发 ✓");
+                    }
+                    if (t.lastError != null && t.lastError.length() > 0) {
+                        sb.append("（").append(t.lastError).append("）");
+                    }
+                    sb.append('\n');
+                }
+            }
+            sb.append("带宽    ：").append(e.bandwidthText()).append('\n');
+            // ★ ④ 安全检查：有目标因为"确认走了"被暂停时，报告里必须写明白（这是安全项）
+            String susp = e.sendSuspendedText();
+            if (susp != null && susp.length() > 0) {
+                sb.append("已暂停  ：").append(susp.replace('\n', ' ')).append('\n');
+            }
+        }
+
+        // ── 对端回话（这就是"让俩设备自己交流"的结果） ──
+        sb.append("\n【对端自己报告的统计】\n");
+        List<PeerStats> psList = e.peerStatsList();
+        if (psList.isEmpty()) {
+            sb.append("还没收到任何对端的统计回话。\n")
+                    .append("（对方那台要是也在跑这个 App，并且我们之间有「收听/送声音」关系，\n")
+                    .append("  它每 2 秒会主动报一次；一直收不到通常说明两台不在同一个 Wi-Fi。）\n");
+        } else {
+            for (PeerStats ps : psList) {
+                long age = ps.ageMs(nowUp);
+                sb.append("· ").append(ps.host);
+                if (ps.name.length() > 0) {
+                    sb.append("（").append(ps.name).append("）");
+                }
+                sb.append('\n');
+                sb.append("    ").append(ps.sending
+                                ? "它说：正在送声音 ✓"
+                                : "它说：没在送声音 ✗（要它那台点「送声音」）")
+                        .append('\n');
+                sb.append("    它已发：").append(ps.sent).append(" 包 / ").append(bytesText(ps.bytes))
+                        .append('\n');
+                sb.append("    它收我：").append(ps.recv).append(" 包 · 丢 ").append(ps.lost)
+                        .append(" · 缓冲 ").append(ps.bufMs).append("ms · 它那边 ")
+                        .append(ps.streams).append(" 条流\n");
+                sb.append("    这份统计：").append(age < 0 ? "?" : (age + "ms") + " 前收到")
+                        .append(ps.fresh(nowUp) ? "（新鲜 ✓）" : "（已过期 ✗）").append('\n');
+            }
+        }
+
+        // ── 一眼判断：把"到底是哪一端的问题"直接写出来 ──
+        conclude(sb, e, nowUp, st, psList);
+
+        // ── 最近错误 ──
+        sb.append("\n【最近一次错误】\n");
+        sb.append("接收：").append(orNone(e.recvLastError())).append('\n');
+        sb.append("发送：").append(orNone(e.sendLastError())).append('\n');
+        sb.append("发现：").append(orNone(e.discLastError())).append('\n');
+
+        // ── 关于作者（2026-11-22 用户要求：让使用者能联系到我）──
+        sb.append("\n【关于作者 / 联系方式】\n");
+        sb.append("本项目由作者根据个人需求修改，欢迎交流反馈。\n");
+        sb.append("抖音：北冥有鱼呀（抖音号 BM1812028）\n");
+        sb.append("B站 ：七月听雪2077（UID 236327920）\n");
+        sb.append("原项目：B站 UP主「书雩」的 Audio Mixing\n");
+        sb.append("       https://github.com/haop2922-ai/AudioMixing\n");
+
+        sb.append("\n========== 报告结束（把整段复制给对方即可） ==========\n");
+        return sb.toString();
+    }
+
+    /**
+     * 「一眼判断」：报告里最值钱的一段。
+     *
+     * <p>用户的原话是"不知道是哪一端没在发、哪一端没收"。所以这里不只是罗列数字，
+     * 而是把两边的话摆在一起下结论：
+     * <ul>
+     *   <li>对方说它在发、而我一个包都没收到 → 九成是两台不在同一个 Wi-Fi（或 AP 隔离）；</li>
+     *   <li>对方说它没在发 → 去对方那台点「送声音」，跟本机没关系；</li>
+     *   <li>本机没在发 → 在本机点「送声音」；</li>
+     *   <li>对方在发、我也在收，但丢包/缓冲很糟 → 是 Wi-Fi 质量问题，不是配置问题。</li>
+     * </ul>
+     */
+    private static void conclude(StringBuilder sb, Engine e, long nowUp,
+                                 AudioRecv.Stats st, List<PeerStats> psList) {
+        sb.append("\n【一眼判断】\n");
+        boolean sending = e.senderRunning();
+        long recvAll = st == null ? 0 : st.received;
+
+        if (sending) {
+            sb.append("· 本机：正在送声音 ✓（已发 ").append(e.sentPackets()).append(" 包，音源 ")
+                    .append(AudioSend.sourceName(e.activeSourceKind())).append("）\n");
+            if (e.sourceMismatch()) {
+                // 最容易让人误判的一种状态：以为是本机声音，其实退回了麦克风（或反过来）。
+                sb.append("· ★ 本机：你想送 ").append(AudioSend.sourceName(e.sourceKind()))
+                        .append("，实际送的是 ").append(AudioSend.sourceName(e.activeSourceKind()))
+                        .append(" → 详情看上面「声音来源」那一段；对面听到的是 ")
+                        .append(AudioSend.sourceShortName(e.activeSourceKind()))
+                        .append("，不是你以为的那个。\n");
+            }
+        } else {
+            sb.append("· 本机：没在送声音 ✗ → 想让对方听见，在本机任意一台设备上点「送声音」\n");
+        }
+        if (e.receiverRunning()) {
+            sb.append("· 本机：接收器在跑，已收到 ").append(recvAll).append(" 个音频包")
+                    .append(recvAll > 0 ? " ✓\n" : "（一个都没有）\n");
+            if (e.isChannelListening() && recvAll == 0) {
+                // ★ 用户现在最常见的现场：电脑在广播、手机开着听广播却没声。这里把两种可能
+                //   按"先查哪个"的顺序写清楚，而不是丢一句"没收到包"。
+                sb.append("· ★ 本机：开着「听广播」却一个包都没收到 → 按顺序查两件事：")
+                        .append("① 对面那台到底在不在广播（电脑上「广播我的声音」要开着，")
+                        .append("而且它的采集设备得真的在出声音）；")
+                        .append("② 对面的发现列表里有没有本机 —— 电脑端的广播**只发给\"它看得见的在线节点\"**，")
+                        .append("看不见就等于发给 0 个人。看上面【发现（信标）】的自检那几行：")
+                        .append("如果写着\"从没收到过自己的信标\"，那是本机/AP 的组播问题，跟对面无关。\n");
+            } else if (e.isChannelListening()) {
+                sb.append("· 本机：听广播已经收到声音 ✓（谁在广播就听谁，不用点设备）\n");
+            }
+        } else {
+            sb.append("· 本机：接收器没在跑 → 想听某台就点它的「🎧 收听」；")
+                    .append("想听电脑正在广播的声音就开「📻 听广播」\n");
+        }
+        try {
+            if (e.peers().isEmpty()) {
+                sb.append("· 本机：设备列表是空的（0 台）。上面【发现（信标）】的自检会说明卡在哪一步：")
+                        .append("「自己绕回来 0」= 本机收不到组播/广播；「不是我们的」很大 = 收到的都是别人的流量；")
+                        .append("「最近收到：一个都没有」= 对面根本没发到你这台。\n");
+            }
+        } catch (Throwable ignored) {
+            // 设备列表读不到不影响其余判断
+        }
+
+        // ★ 坏包的说人话版本：一个"坏包 3220"的数字没用，这里直接给结论和下一步动作。
+        //   （必须放在下面"对端没回话就 return"之前，否则最需要这段的时候反而看不到。）
+        if (st != null && st.badPackets > 0) {
+            if (st.badCodec > 0) {
+                sb.append("· 本机：有 ").append(st.badCodec)
+                        .append(" 个音频包的编码不是 PCM16（").append(nz(st.lastCodecSeen))
+                        .append("）→ 手机只有 PCM16 解码器，去对面那台把编码改成 pcm_s16 就能听见。\n");
+            }
+            if (st.badFrames > 0) {
+                sb.append("· 本机：有 ").append(st.badFrames)
+                        .append(" 个包不是 480 帧/10ms 一包 → 手机只认这一档（不做重采样），")
+                        .append("要对面把每包帧数改回 480。\n");
+            }
+            if (st.badMagic > 0) {
+                sb.append("· 本机：有 ").append(st.badMagic)
+                        .append(" 个包的 magic 不对（根本不是我们这套协议）→ 通常不是对方发的，")
+                        .append("而是网络里别人的广播/扫描流量，或者是另一套协议（网页端/别的 App）。")
+                        .append("看上面「最近坏包」那一行开头的十六进制就能定性。\n");
+            }
+            if (st.badShort > 0) {
+                sb.append("· 本机：有 ").append(st.badShort)
+                        .append(" 个包太短（连 28 字节包头都不够）→ 是别的流量或者被截断的包，不影响收听。\n");
+            }
+            if (st.badVersion > 0) {
+                sb.append("· 本机：有 ").append(st.badVersion)
+                        .append(" 个包版本号不是 1 → 对面那台的协议版本和本机不一致（一边升级了一边没升）。\n");
+            }
+            long classified = st.badMagic + st.badVersion + st.badShort + st.badCodec + st.badFrames;
+            if (st.badPackets > classified) {
+                sb.append("· 本机：另有 ").append(st.badPackets - classified)
+                        .append(" 个坏包没归到已知类别里（多半是更早版本记下的旧数字）。\n");
+            }
+        }
+
+        if (psList.isEmpty()) {
+            sb.append("· 对端：一句话都没回。要么对方那台没打开 App，要么两台不在同一个 Wi-Fi")
+                    .append("（路由器开了客户端隔离也会这样）。\n");
+            return;
+        }
+        for (PeerStats ps : psList) {
+            if (!ps.fresh(nowUp)) {
+                sb.append("· 对端 ").append(ps.host)
+                        .append("：超过 ").append(PEER_TTL_MS / 1000)
+                        .append(" 秒没回话 ✗ → 那台的 App 可能被系统杀了/切后台了。\n");
+                continue;
+            }
+            if (!ps.sending) {
+                sb.append("· 对端 ").append(ps.host)
+                        .append("：它自己说没在发 ✗ → 去它那台点「送声音」，本机这边没问题。\n");
+                continue;
+            }
+            // 对方说它在发：那就只看"我到底收到没有"——这才是真正的分界线。
+            long got = recvFrom(st, ps.host);
+            if (got > 0) {
+                sb.append("· 对端 ").append(ps.host).append("：它在发、本机也收到了 ")
+                        .append(got).append(" 包 ✓");
+                if (ps.lost > 0 || (st != null && st.lost > 0)) {
+                    sb.append("，但有丢包（本机 ").append(st == null ? 0 : st.lost)
+                            .append(" / 它 ").append(ps.lost).append("）")
+                            .append(" → 属于 Wi-Fi 质量问题，靠近路由器或改成 5G 频段试试");
+                }
+                sb.append('\n');
+            } else {
+                sb.append("· 对端 ").append(ps.host)
+                        .append("：它说它在发，但本机一个包都没收到 ✗ ← ")
+                        .append("最可能的原因：两台不在同一个 Wi-Fi、路由器开了「客户端隔离/AP 隔离」，")
+                        .append("或者本机接收器没起来（上面「运行状态」里看接收器）。\n");
+            }
+            if (ps.recv == 0 && sending) {
+                sb.append("· 对端 ").append(ps.host)
+                        .append("：本机在发，但它报的收包数是 0 → 它那边没在收（它没点「🎧 收听」，")
+                        .append("或者它那边的接收器没起来）。\n");
+            }
+        }
+    }
+
+    /** 某一路（某台设备）收到的包数；没有这条流就是 0。 */
+    private static long recvFrom(AudioRecv.Stats st, String host) {
+        if (st == null || st.streams == null || host == null) {
+            return 0;
+        }
+        for (AudioRecv.StreamStats ss : st.streams) {
+            if (host.equals(ss.host)) {
+                return ss.received;
+            }
+        }
+        return 0;
+    }
+
+    // ══════════════════════════════ 小工具 ══════════════════════════════
+
+    /** 字节数转人话（"11.0 MB"），和界面上「已发 … MB」的写法一致。 */
+    public static String bytesText(long bytes) {
+        if (bytes < 0) {
+            bytes = 0;
+        }
+        if (bytes < 1024) {
+            return bytes + " B";
+        }
+        if (bytes < 1048576L) {
+            return String.format(Locale.US, "%.1f KB", bytes / 1024.0);
+        }
+        if (bytes < 1073741824L) {
+            return String.format(Locale.US, "%.1f MB", bytes / 1048576.0);
+        }
+        return String.format(Locale.US, "%.2f GB", bytes / 1073741824.0);
+    }
+
+    private static String percent(float v) {
+        if (Float.isNaN(v) || v < 0f) {
+            v = 0f;
+        }
+        return String.format(Locale.US, "%.0f%%", Math.min(1f, v) * 100f);
+    }
+
+    private static String onOff(boolean b) {
+        return b ? "运行中 ✓" : "已停止 ✗";
+    }
+
+    private static String orNone(String s) {
+        return (s == null || s.length() == 0) ? "（无）" : s;
+    }
+
+    /** 坏包现场样本：有才写一行（缩进），没有就不占篇幅。 */
+    private static void appendSample(StringBuilder sb, String label, String sample) {
+        if (sample != null && sample.length() > 0) {
+            sb.append("  ").append(label).append("：").append(sample).append('\n');
+        }
+    }
+
+    private static String indent(String s) {
+        if (s == null) {
+            return "  （无）";
+        }
+        return "  " + s.replace("\n", "\n  ");
+    }
+
+    private static List<Discovery.Peer> safePeers(Engine e) {
+        try {
+            List<Discovery.Peer> l = e.peers();
+            return l == null ? java.util.Collections.<Discovery.Peer>emptyList() : l;
+        } catch (Throwable t) {
+            return java.util.Collections.emptyList();
+        }
+    }
+
+    private static String timeText(long ms) {
+        try {
+            return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date(ms));
+        } catch (Throwable t) {
+            return String.valueOf(ms);
+        }
+    }
+
+    /** 进程跑了多久（诊断里很有用：刚重启过和跑了一小时的现场完全不一样）。 */
+    private static String durationText(long upMs) {
+        long sec = upMs / 1000;
+        if (sec < 60) {
+            return sec + " 秒";
+        }
+        long min = sec / 60;
+        if (min < 60) {
+            return min + " 分 " + (sec % 60) + " 秒";
+        }
+        return (min / 60) + " 小时 " + (min % 60) + " 分";
+    }
+
+    /** 版本号：API 28 起 {@code versionCode} 被标了过时（要换成 getLongVersionCode），
+     *  但我们 minSdk 24，两个都得留着，所以这里显式压掉那条警告。 */
+    @SuppressWarnings("deprecation")
+    private static String appVersion(Context ctx) {
+        if (ctx == null) {
+            return "未知";
+        }
+        try {
+            PackageInfo pi = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0);
+            return pi.versionName + "（versionCode " + pi.versionCode + "）";
+        } catch (Throwable t) {
+            return "读取失败：" + t;
+        }
+    }
+
+    private static String androidVersion() {
+        try {
+            return "Android " + Build.VERSION.RELEASE + "（API " + Build.VERSION.SDK_INT + "）· "
+                    + Build.MANUFACTURER + " " + Build.MODEL;
+        } catch (Throwable t) {
+            return "未知";
+        }
+    }
+
+    // ── 极简 JSON 读写（只支持我们自己的字段类型：字符串/整数/bool） ──
+
+    private static String escape(String s) {
+        if (s == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"':
+                    sb.append("\\\"");
+                    break;
+                case '\\':
+                    sb.append("\\\\");
+                    break;
+                case '\n':
+                    sb.append("\\n");
+                    break;
+                case '\r':
+                    sb.append("\\r");
+                    break;
+                case '\t':
+                    sb.append("\\t");
+                    break;
+                default:
+                    // 控制字符一律丢掉：设备名里混进它们会让对端的解析变复杂，不值当。
+                    if (c >= 0x20) {
+                        sb.append(c);
+                    }
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 找到 {@code "key"} 后面那个值的起始下标；找不到返回 -1。 */
+    private static int valueStart(String s, String key) {
+        String pat = "\"" + key + "\"";
+        int i = s.indexOf(pat);
+        if (i < 0) {
+            return -1;
+        }
+        int colon = s.indexOf(':', i + pat.length());
+        if (colon < 0) {
+            return -1;
+        }
+        int v = colon + 1;
+        while (v < s.length() && Character.isWhitespace(s.charAt(v))) {
+            v++;
+        }
+        return v < s.length() ? v : -1;
+    }
+
+    private static String str(String s, String key) {
+        int v = valueStart(s, key);
+        if (v < 0 || s.charAt(v) != '"') {
+            return null;
+        }
+        StringBuilder out = new StringBuilder(32);
+        for (int i = v + 1; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '"') {
+                return out.toString();
+            }
+            if (c == '\\' && i + 1 < s.length()) {
+                char n = s.charAt(++i);
+                switch (n) {
+                    case 'n':
+                        out.append('\n');
+                        break;
+                    case 'r':
+                        out.append('\r');
+                        break;
+                    case 't':
+                        out.append('\t');
+                        break;
+                    case 'u':
+                        // 「反斜杠 + u + 四位十六进制」的转义：解析失败就原样跳过，
+                        // 不因为一个坏转义把整包作废。
+                        // 注意：这里必须避开真正的那种转义写法 —— javac 在词法分析之前
+                        // 就会处理它，注释里写了不合法的形式会直接编译不过。
+                        if (i + 4 < s.length()) {
+                            try {
+                                out.append((char) Integer.parseInt(s.substring(i + 1, i + 5), 16));
+                                i += 4;
+                            } catch (Throwable ignored) {
+                                // 保持原样
+                            }
+                        }
+                        break;
+                    default:
+                        out.append(n);
+                }
+                continue;
+            }
+            out.append(c);
+        }
+        return out.toString();   // 没有收尾引号（被截断）：返回已读到的部分
+    }
+
+    /** 读一个小数（"0.77"）。我们的值只有两位小数，所以整数部分 + 两位小数就够了。 */
+    private static float numF(String s, String key, float def) {
+        int v = valueStart(s, key);
+        if (v < 0) {
+            return def;
+        }
+        int i = v;
+        boolean neg = i < s.length() && s.charAt(i) == '-';
+        if (neg) {
+            i++;
+        }
+        long whole = 0;
+        int digits = 0;
+        while (i < s.length() && digits < 9) {
+            char c = s.charAt(i);
+            if (c < '0' || c > '9') {
+                break;
+            }
+            whole = whole * 10 + (c - '0');
+            i++;
+            digits++;
+        }
+        if (digits == 0) {
+            return def;
+        }
+        int frac = 0;
+        int scale = 1;
+        if (i < s.length() && s.charAt(i) == '.') {
+            i++;
+            for (int k = 0; k < 2 && i < s.length(); k++, i++) {
+                char c = s.charAt(i);
+                if (c < '0' || c > '9') {
+                    break;
+                }
+                frac = frac * 10 + (c - '0');
+                scale *= 10;
+            }
+        }
+        float out = whole + frac / (float) scale;
+        return neg ? -out : out;
+    }
+
+    private static long num(String s, String key, long def) {        int v = valueStart(s, key);
+        if (v < 0) {
+            return def;
+        }
+        boolean neg = s.charAt(v) == '-';
+        int i = neg ? v + 1 : v;
+        long r = 0;
+        int digits = 0;
+        while (i < s.length() && digits < 18) {
+            char c = s.charAt(i);
+            if (c < '0' || c > '9') {
+                break;
+            }
+            r = r * 10 + (c - '0');
+            i++;
+            digits++;
+        }
+        if (digits == 0) {
+            return def;
+        }
+        return neg ? -r : r;
+    }
+
+    private static boolean bool(String s, String key, boolean def) {
+        int v = valueStart(s, key);
+        if (v < 0) {
+            return def;
+        }
+        if (s.startsWith("true", v)) {
+            return true;
+        }
+        if (s.startsWith("false", v)) {
+            return false;
+        }
+        return def;
+    }
+
+    private static long clamp(long v, long lo, long hi) {
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+
+    private static String nz(String s) {
+        return s == null ? "" : s;
+    }
+}

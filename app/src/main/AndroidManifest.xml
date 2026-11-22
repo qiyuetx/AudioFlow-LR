@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          package="com.audiomixing.app">
+    <!--
+      package：AGP 8 用 namespace 生成，但手工 aapt2 link 必须要有它。
+      与 app/build.gradle 的 namespace / applicationId 完全一致，两种构建方式都认。
+    -->
+    <!-- 手动构建（aapt2 直连）时也要写明 SDK 级别，否则安装器按 1 处理。 -->
+    <uses-sdk android:minSdkVersion="22" android:targetSdkVersion="34"/>
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
+    <!--
+      WAKE_LOCK 是必须的：AudioRecv/AudioSend 会各拿一个 WifiLock，
+      让 Wi-Fi 在息屏后别进省电模式（省电模式会把抖动缓冲冲垮，听感就是一顿一顿）。
+      忘了声明它时，真机上会看到 "Neither user ... has android.permission.WAKE_LOCK"
+      —— 这是 2026-10-12 真机反馈里抓到的第二个 bug。
+    -->
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+    <!--
+      MEDIA_PROJECTION：用来采集【本机正在播放的声音】（音乐/视频/游戏），
+      也就是这个 App 真正的用途 —— 早期版本只采了麦克风，那是"对讲机"不是音频投射，
+      用户明确指出过这个方向性错误。
+      为此需要前台服务带上 mediaProjection 类型：targetSdk 34 下，
+      没在已启动的 mediaProjection 类型前台服务里调用 getMediaProjection() 会直接抛异常。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!--
+      ★ 2026-11-12 用户：「能不能加入开机自动启动加后台保活」。
+      RECEIVE_BOOT_COMPLETED：开机广播（BootReceiver 据此把前台服务拉起来）。
+      REQUEST_IGNORE_BATTERY_OPTIMIZATIONS：请求加入"不优化"白名单 —— 不加的话
+      国产 ROM 的省电策略会在息屏后掐掉服务，界面上那句"锁屏不断流"就成了空话。
+    -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+    <!--
+      android:icon：★ 2026-10-17 用户（图3）反馈「应用app内外不一致，我喜欢里面这个蓝色的感觉」。
+      应用内 LogoView 画的是蓝色渐变圆角方块 + 白字，而安装到桌面上的图标还是系统默认那个
+      绿色安卓小人 —— 里外两个样子。这里挂上资源目录里那套同款图标（mipmap-*/ic_launcher.png：
+      蓝色渐变 140deg（#38bdf8 → #6366f1）圆角方块 + 白色，四角透明、四周留 8% 边距）。
+    -->
+    <application android:label="AudioFlow-LR" android:icon="@mipmap/ic_launcher"
+                 android:theme="@android:style/Theme.Material.NoActionBar">
+        <activity android:name=".MainActivity" android:exported="true"
+                  android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+        <!--
+          前台服务：手机当节点时，App 切到后台也要继续收发声音。
+          type = mediaPlayback（播别人的声音）+ microphone（对讲用的麦克风）
+                 + mediaProjection（采本机正在播放的声音，见上面的权限说明）。
+          三个都要声明：targetSdk 34 起，startForeground 带的类型必须与清单一致，
+          缺一个就在那一条路上抛 SecurityException。
+        -->
+        <!-- android:stopWithTask="true"：用户从最近任务里划掉 App 时，
+             系统直接把服务停掉，而不是让 START_STICKY 的服务继续活着、
+             一直攥着 MediaProjection（系统会显示「正在获取屏幕」）。 -->
+        <service android:name=".MixService" android:exported="false"
+                 android:stopWithTask="true"
+                 android:foregroundServiceType="mediaPlayback|microphone|mediaProjection"/>
+        <!--
+          ★ 2026-11-12：开机自启。三个 action 各有用途：
+            · BOOT_COMPLETED        标准开机广播（系统级，Android 8~14 都允许从这里起前台服务）
+            · QUICKBOOT_POWERON     部分国产 ROM 用的厂商广播，两个都收兼容性最好
+            · MY_PACKAGE_REPLACED   覆盖安装完自动恢复在线，不必等用户再点一次 App
+          exported=true 是必须的：广播由系统进程发出来，非导出收不到。
+        -->
+        <receiver android:name=".BootReceiver" android:exported="true"
+                  android:enabled="true">
+            <intent-filter android:priority="1000">
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON"/>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
