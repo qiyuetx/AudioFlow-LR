@@ -46,7 +46,7 @@
       绿色安卓小人 —— 里外两个样子。这里挂上资源目录里那套同款图标（mipmap-*/ic_launcher.png：
       蓝色渐变 140deg（#38bdf8 → #6366f1）圆角方块 + 白色，四角透明、四周留 8% 边距）。
     -->
-    <application android:label="AudioFlow-LR" android:icon="@mipmap/ic_launcher"
+    <application android:label="AudioFlow.LR" android:icon="@mipmap/ic_launcher"
                  android:theme="@android:style/Theme.Material.NoActionBar">
         <activity android:name=".MainActivity" android:exported="true"
                   android:configChanges="orientation|screenSize|keyboardHidden">

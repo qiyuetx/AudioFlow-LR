@@ -592,7 +592,7 @@ public class MixService extends Service {
                 ? new Notification.Builder(this, CHANNEL_ID)
                 : new Notification.Builder(this);
         b.setSmallIcon(android.R.drawable.ic_btn_speak_now)
-                .setContentTitle("AudioFlow-LR 正在运行")
+                .setContentTitle("AudioFlow.LR 正在运行")
                 .setContentText(text)
                 .setStyle(new Notification.BigTextStyle().bigText(text))
                 .setContentIntent(content)

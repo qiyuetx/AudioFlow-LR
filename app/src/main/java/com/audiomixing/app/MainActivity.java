@@ -1287,7 +1287,7 @@ public class MainActivity extends Activity {
         copy.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                copyToClipboard("AudioFlow-LR 诊断/关于报告", body.getText().toString());
+                copyToClipboard("AudioFlow.LR 诊断/关于报告", body.getText().toString());
             }
         });
         LinearLayout.LayoutParams clp = margins(0, dpi(46), 0, dpi(12), dpi(8), 0);
@@ -3365,7 +3365,7 @@ public class MainActivity extends Activity {
         LinearLayout titleRow = new LinearLayout(this);
         titleRow.setOrientation(LinearLayout.HORIZONTAL);
         titleRow.setGravity(Gravity.CENTER_VERTICAL);
-        titleRow.addView(text("AudioFlow-LR", 16f, FG, true));
+        titleRow.addView(text("AudioFlow.LR", 16f, FG, true));
         // 只放版本名（v2.34）：带 versionCode 会在这个窄位置换行，看着像排版坏了。
         TextView ver = text("v" + BuildConfig.VERSION_NAME, 10.5f, DIM, false);
         ver.setSingleLine(true);
@@ -3564,7 +3564,7 @@ public class MainActivity extends Activity {
         pb.setIndeterminateTintList(ColorStateList.valueOf(ACC));
         card.addView(pb, margins(MATCH, dpi(4), 0, dpi(14), 0, 0));
 
-        TextView h = text("让另一台手机 / 电脑打开 AudioFlow-LR，它就会自动出现在这里。", 12f, DIM, false);
+        TextView h = text("让另一台手机 / 电脑打开 AudioFlow.LR，它就会自动出现在这里。", 12f, DIM, false);
         h.setGravity(Gravity.CENTER);
         card.addView(h, margins(MATCH, WRAP, 0, dpi(12), 0, 0));
         registerLong(dynLongTextViews, h);      // 教学文字：简洁档收起来

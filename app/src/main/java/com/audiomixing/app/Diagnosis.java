@@ -596,7 +596,7 @@ public final class Diagnosis {
     public static String build(Context ctx, Engine e) {
         long nowUp = SystemClock.elapsedRealtime();
         StringBuilder sb = new StringBuilder(2048);
-        sb.append("========== AudioFlow-LR 诊断/关于报告 ==========\n");
+        sb.append("========== AudioFlow.LR 诊断/关于报告 ==========\n");
         sb.append("生成时间：").append(timeText(System.currentTimeMillis())).append('\n');
         sb.append("App     ：").append(appVersion(ctx)).append('\n');
         sb.append("系统    ：").append(androidVersion()).append('\n');
